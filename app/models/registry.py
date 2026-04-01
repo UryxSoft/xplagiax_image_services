@@ -283,23 +283,27 @@ class ModelRegistry:
             ).observe(elapsed_ms / 1000)
 
             id2label = self._siglip.config.id2label
+            labels = list(id2label.values())
+            ai_variants = ("ai", "artificial", "generated", "fake")
+            ai_indices = [
+                idx for idx, label in id2label.items()
+                if label.lower() in ai_variants
+            ]
 
             for prob_row in probs:
-                scores = {
-                    id2label[j]: float(prob_row[j])
-                    for j in range(len(prob_row))
-                }
-                top_label = max(scores, key=scores.get)
-                top_confidence = scores[top_label]
+                top_idx = np.argmax(prob_row)
+                top_label = id2label[top_idx]
+                top_confidence = float(prob_row[top_idx])
 
                 # Normalise label variants ('AI', 'ai', 'artificial', etc.)
-                is_ai = top_label.lower() in ("ai", "artificial", "generated", "fake")
+                is_ai = top_label.lower() in ai_variants
                 is_human = not is_ai
 
-                ai_score = max(
-                    (v for k, v in scores.items() if k.lower() in ("ai", "artificial", "generated", "fake")),
-                    default=1.0 - top_confidence if is_human else top_confidence,
-                )
+                if ai_indices:
+                    ai_score = float(np.max(prob_row[ai_indices]))
+                else:
+                    ai_score = 1.0 - top_confidence if is_human else top_confidence
+
                 human_score = 1.0 - ai_score
 
                 get_metrics().siglip_confidence.observe(top_confidence)
@@ -312,7 +316,10 @@ class ModelRegistry:
                         confidence=top_confidence,
                         ai_score=round(ai_score, 6),
                         human_score=round(human_score, 6),
-                        all_scores={k: round(v, 6) for k, v in scores.items()},
+                        all_scores={
+                            labels[j]: round(float(prob_row[j]), 6)
+                            for j in range(len(prob_row))
+                        },
                         model_id=self._siglip_model_id,
                         duration_ms=elapsed_ms / len(batch),
                     )

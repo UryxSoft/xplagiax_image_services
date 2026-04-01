@@ -128,6 +128,7 @@ class SecurityConfig:
     allowed_mime_types: frozenset
     rate_limit_per_minute: int
     rate_limit_per_hour: int
+    reset_confirmation_token: str
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,7 @@ def load_config() -> AppConfig:
         ),
         rate_limit_per_minute=_optional_int("RATE_LIMIT_PER_MINUTE", 30),
         rate_limit_per_hour=_optional_int("RATE_LIMIT_PER_HOUR", 500),
+        reset_confirmation_token=_require("RESET_CONFIRMATION_TOKEN"),
     )
 
     storage = StorageConfig(

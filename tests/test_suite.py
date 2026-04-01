@@ -361,6 +361,7 @@ class TestApiRoutes(unittest.TestCase):
                 allowed_mime_types=frozenset({"jpeg", "png", "webp"}),
                 rate_limit_per_minute=1000,
                 rate_limit_per_hour=10000,
+                reset_confirmation_token="test-reset-token",
             ),
             storage=StorageConfig(
                 image_backend="local", local_base_path="/tmp/test_images",
@@ -495,6 +496,16 @@ class TestApiRoutes(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         data = resp.get_json()
         self.assertEqual(data["code"], "CONFIRMATION_REQUIRED")
+
+    def test_reset_with_correct_confirmation_succeeds(self):
+        resp = self.client.delete(
+            "/api/v1/admin/collection/reset",
+            json={"confirm": "test-reset-token"},
+            headers=self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["status"], "collection_reset")
 
     # -- Error format --
 

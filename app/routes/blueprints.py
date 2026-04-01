@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import hmac
 from typing import Optional
 
 from flask import Blueprint, current_app, g, jsonify, request, send_file
@@ -575,8 +576,6 @@ def api_usage():
 # admin_bp — destructive operations
 # ===========================================================================
 
-RESET_CONFIRMATION_TOKEN = "I_UNDERSTAND_THIS_WILL_DELETE_ALL_DATA"
-
 
 @admin_bp.route("/collection/reset", methods=["DELETE"])
 @require_auth
@@ -585,12 +584,14 @@ def reset_collection():
     Drop and recreate the entire Qdrant collection.
     DESTRUCTIVE. Requires explicit confirmation token.
     """
+    cfg = _svc("security_config")
     data = request.get_json(silent=True) or {}
-    if data.get("confirm") != RESET_CONFIRMATION_TOKEN:
+    confirm_token = data.get("confirm", "")
+    if not hmac.compare_digest(confirm_token, cfg.reset_confirmation_token):
         return jsonify({
             "error": "Confirmation required",
             "code": "CONFIRMATION_REQUIRED",
-            "hint": f"Send JSON body: {{\"confirm\": \"{RESET_CONFIRMATION_TOKEN}\"}}",
+            "hint": "Check documentation for the required confirmation token",
         }), 400
 
     try:

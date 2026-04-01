@@ -1,0 +1,290 @@
+"""
+Object storage abstraction.
+
+Supports:
+  - local: filesystem storage (dev / single-node)
+  - s3 / minio: S3-compatible object storage (production)
+
+The storage backend is selected at config time.
+All image retrieval goes through pre-signed URLs (S3) or
+direct serving (local), keeping the vector metadata decoupled
+from the binary storage location.
+
+This solves the critical architectural flaw where the original
+service stored images on the container filesystem — making the
+service stateful and incompatible with horizontal scaling.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import os
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Optional, Tuple
+
+from PIL import Image
+
+from app.observability.telemetry import get_logger
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Abstract interface
+# ---------------------------------------------------------------------------
+
+class ImageStorage(ABC):
+
+    @abstractmethod
+    def save(
+        self,
+        image_bytes: bytes,
+        content_hash: str,
+        group_id: str,
+        filename: str,
+        mime_type: str,
+    ) -> str:
+        """
+        Persist image bytes. Returns a storage_key that can later be
+        passed to get_url() or load().
+        """
+
+    @abstractmethod
+    def load(self, storage_key: str) -> bytes:
+        """Load raw image bytes from storage."""
+
+    @abstractmethod
+    def get_url(self, storage_key: str, expiry_seconds: int = 3600) -> str:
+        """
+        Return a URL to access the image.
+        For local: returns the service's own endpoint path.
+        For S3: returns a pre-signed URL.
+        """
+
+    @abstractmethod
+    def delete(self, storage_key: str) -> None:
+        """Remove image from storage."""
+
+    @abstractmethod
+    def exists(self, storage_key: str) -> bool:
+        """Check if image exists without loading it."""
+
+    def backend_name(self) -> str:
+        return self.__class__.__name__
+
+
+# ---------------------------------------------------------------------------
+# Local filesystem backend
+# ---------------------------------------------------------------------------
+
+class LocalImageStorage(ImageStorage):
+    """
+    Stores images under base_path/{group_id}/{content_hash[:2]}/{content_hash}.{ext}
+    The content_hash-based path ensures:
+      - No name collisions
+      - Idempotent writes (same image = same path)
+      - Natural directory sharding (first 2 chars)
+    """
+
+    def __init__(self, base_path: str) -> None:
+        self._base = Path(base_path)
+        self._base.mkdir(parents=True, exist_ok=True)
+        logger.info("local_storage_ready", base_path=str(self._base))
+
+    def _build_path(self, storage_key: str) -> Path:
+        return self._base / storage_key
+
+    def save(
+        self,
+        image_bytes: bytes,
+        content_hash: str,
+        group_id: str,
+        filename: str,
+        mime_type: str,
+    ) -> str:
+        ext = mime_type if mime_type != "jpeg" else "jpg"
+        # Shard by first 2 chars of hash → avoids huge flat directories
+        storage_key = f"{group_id}/{content_hash[:2]}/{content_hash}.{ext}"
+        full_path = self._base / storage_key
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not full_path.exists():
+            full_path.write_bytes(image_bytes)
+            logger.debug("image_saved_local", storage_key=storage_key)
+        else:
+            logger.debug("image_already_exists_local", storage_key=storage_key)
+
+        return storage_key
+
+    def load(self, storage_key: str) -> bytes:
+        path = self._build_path(storage_key)
+        if not path.exists():
+            raise FileNotFoundError(f"Image not found: {storage_key}")
+        return path.read_bytes()
+
+    def get_url(self, storage_key: str, expiry_seconds: int = 3600) -> str:
+        # Routes to the service's own /images/{storage_key} endpoint
+        return f"/images/{storage_key}"
+
+    def delete(self, storage_key: str) -> None:
+        path = self._build_path(storage_key)
+        if path.exists():
+            path.unlink()
+            logger.info("image_deleted_local", storage_key=storage_key)
+
+    def exists(self, storage_key: str) -> bool:
+        return self._build_path(storage_key).exists()
+
+
+# ---------------------------------------------------------------------------
+# S3 / MinIO backend
+# ---------------------------------------------------------------------------
+
+class S3ImageStorage(ImageStorage):
+    """
+    S3-compatible object storage (AWS S3, MinIO, GCS with S3 compat, etc.)
+
+    Uses boto3. Set s3_endpoint_url for MinIO or other S3-compatible services.
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        region: str,
+        access_key: Optional[str],
+        secret_key: Optional[str],
+        endpoint_url: Optional[str],
+        presigned_expiry: int,
+    ) -> None:
+        import boto3
+        from botocore.exceptions import BotoCoreError
+
+        self._bucket = bucket
+        self._presigned_expiry = presigned_expiry
+
+        kwargs: dict = {"region_name": region}
+        if endpoint_url:
+            kwargs["endpoint_url"] = endpoint_url
+        if access_key and secret_key:
+            kwargs["aws_access_key_id"] = access_key
+            kwargs["aws_secret_access_key"] = secret_key
+
+        self._s3 = boto3.client("s3", **kwargs)
+
+        # Ensure bucket exists (create if using MinIO)
+        try:
+            self._s3.head_bucket(Bucket=bucket)
+        except Exception:
+            try:
+                self._s3.create_bucket(Bucket=bucket)
+                logger.info("s3_bucket_created", bucket=bucket)
+            except Exception as exc:
+                logger.warning("s3_bucket_check_failed", bucket=bucket, error=str(exc))
+
+        logger.info(
+            "s3_storage_ready",
+            bucket=bucket,
+            endpoint=endpoint_url or "aws",
+        )
+
+    def _build_key(
+        self,
+        content_hash: str,
+        group_id: str,
+        mime_type: str,
+    ) -> str:
+        ext = mime_type if mime_type != "jpeg" else "jpg"
+        return f"images/{group_id}/{content_hash[:2]}/{content_hash}.{ext}"
+
+    def save(
+        self,
+        image_bytes: bytes,
+        content_hash: str,
+        group_id: str,
+        filename: str,
+        mime_type: str,
+    ) -> str:
+        key = self._build_key(content_hash, group_id, mime_type)
+        content_type = f"image/{mime_type}"
+
+        try:
+            # Check existence first to avoid redundant upload
+            self._s3.head_object(Bucket=self._bucket, Key=key)
+            logger.debug("s3_object_exists", key=key)
+        except Exception:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=image_bytes,
+                ContentType=content_type,
+                Metadata={
+                    "original_filename": filename,
+                    "content_hash": content_hash,
+                    "group_id": group_id,
+                },
+            )
+            logger.debug("s3_object_uploaded", key=key, size=len(image_bytes))
+
+        return key
+
+    def load(self, storage_key: str) -> bytes:
+        try:
+            response = self._s3.get_object(Bucket=self._bucket, Key=storage_key)
+            return response["Body"].read()
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"Image not found in S3: {storage_key}"
+            ) from exc
+
+    def get_url(self, storage_key: str, expiry_seconds: int = 3600) -> str:
+        return self._s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self._bucket, "Key": storage_key},
+            ExpiresIn=expiry_seconds,
+        )
+
+    def delete(self, storage_key: str) -> None:
+        self._s3.delete_object(Bucket=self._bucket, Key=storage_key)
+        logger.info("s3_object_deleted", key=storage_key)
+
+    def exists(self, storage_key: str) -> bool:
+        try:
+            self._s3.head_object(Bucket=self._bucket, Key=storage_key)
+            return True
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def create_storage(
+    backend: str,
+    local_base_path: str = "/data/images",
+    s3_bucket: Optional[str] = None,
+    s3_region: str = "us-east-1",
+    s3_endpoint_url: Optional[str] = None,
+    s3_access_key: Optional[str] = None,
+    s3_secret_key: Optional[str] = None,
+    presigned_expiry: int = 3600,
+) -> ImageStorage:
+    if backend == "local":
+        return LocalImageStorage(local_base_path)
+    elif backend in ("s3", "minio"):
+        if not s3_bucket:
+            raise ValueError("S3_BUCKET must be set when IMAGE_BACKEND=s3")
+        return S3ImageStorage(
+            bucket=s3_bucket,
+            region=s3_region,
+            access_key=s3_access_key,
+            secret_key=s3_secret_key,
+            endpoint_url=s3_endpoint_url,
+            presigned_expiry=presigned_expiry,
+        )
+    else:
+        raise ValueError(
+            f"Unknown IMAGE_BACKEND='{backend}'. Choose: local, s3, minio"
+        )

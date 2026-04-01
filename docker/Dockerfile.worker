@@ -1,0 +1,54 @@
+# ============================================================
+# Dockerfile.worker — RQ ML inference worker
+# Same base as API but entrypoint is the RQ worker command
+# ============================================================
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libffi-dev libssl-dev \
+    libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+# ---- Runtime ----
+FROM python:3.11-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg62-turbo libpng16-16 libtiff6 libwebp7 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r workeruser && useradd -r -g workeruser -d /app -s /sbin/nologin workeruser
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+COPY app/ ./app/
+
+# Pre-download models (worker needs them at startup, not lazily)
+ARG DOWNLOAD_MODELS=false
+RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
+    python -c "\
+from transformers import AutoImageProcessor, SiglipForImageClassification; \
+from sentence_transformers import SentenceTransformer; \
+AutoImageProcessor.from_pretrained('Ateeqq/ai-vs-human-image-detector'); \
+SiglipForImageClassification.from_pretrained('Ateeqq/ai-vs-human-image-detector'); \
+SentenceTransformer('clip-ViT-B-32'); \
+print('Models downloaded for worker')"; \
+fi
+
+RUN mkdir -p /data/images /tmp && chown -R workeruser:workeruser /app /data
+
+USER workeruser
+
+# RQ worker — listens to 'indexing' queue
+CMD ["rq", "worker", "indexing", \
+     "--url", "redis://redis:6379", \
+     "--max-jobs", "0", \
+     "--burst-mode-timeout", "0"]

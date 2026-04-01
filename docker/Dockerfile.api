@@ -1,0 +1,75 @@
+# ============================================================
+# Dockerfile.api — Flask API (Gunicorn + gevent)
+# Multi-stage build: builder installs deps, runtime is slim
+# ============================================================
+
+# ---- Stage 1: Builder ----
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# System deps for Pillow, torch, transformers
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libffi-dev libssl-dev \
+    libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
+    curl git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps into /install — kept separate from system Python
+COPY requirements.txt .
+RUN pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+# ---- Stage 2: Runtime ----
+FROM python:3.11-slim AS runtime
+
+LABEL maintainer="xplagiax" \
+      description="AI Image Detection & Similarity Search API"
+
+# Runtime system deps only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg62-turbo libpng16-16 libtiff6 libwebp7 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user for security
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy application code
+COPY app/ ./app/
+
+# Pre-download HuggingFace models into image (avoids runtime network calls)
+# Comment out if you prefer to mount a model cache volume instead
+ARG DOWNLOAD_MODELS=false
+RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
+    python -c "\
+from transformers import AutoImageProcessor, SiglipForImageClassification; \
+from sentence_transformers import SentenceTransformer; \
+AutoImageProcessor.from_pretrained('Ateeqq/ai-vs-human-image-detector'); \
+SiglipForImageClassification.from_pretrained('Ateeqq/ai-vs-human-image-detector'); \
+SentenceTransformer('clip-ViT-B-32'); \
+print('Models downloaded')"; \
+fi
+
+# Gunicorn config
+COPY docker/gunicorn.conf.py ./gunicorn.conf.py
+
+# Data directories
+RUN mkdir -p /data/images /tmp && chown -R appuser:appuser /app /data
+
+USER appuser
+
+EXPOSE 5000 9090
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:5000/healthz || exit 1
+
+# gevent worker: async I/O, non-blocking — optimal for Flask + ML inference
+# (inference blocks the gevent greenlet but not other greenlets)
+CMD ["gunicorn", \
+     "--config", "gunicorn.conf.py", \
+     "app.factory:create_app()"]

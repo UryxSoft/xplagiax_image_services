@@ -261,6 +261,48 @@ curl http://localhost:9333/cluster/status
 curl http://localhost:6333/healthz
 ```
 
+### 8 -  Internal DOKCER use
+```bash
+cd xplagiax_image_service
+docker build -t xplagiax_is:latest .
+
+# API
+docker run -d \
+  --name xplagiax-api \
+  --network xplagiax-net \
+  --restart unless-stopped \
+  -e SERVICE_API_KEY=mi_clave_super_secreta_aqui \
+  -e SERPAPI_KEY=tu_key_de_serpapi \
+  -e ZENSERP_KEY=tu_key_de_zenserp \
+  -e QDRANT_HOST=qdrant \
+  -e QDRANT_PORT=6333 \
+  -e REDIS_HOST=redis-server \
+  -e REDIS_PORT=6379 \
+  -e SEAWEEDFS_FILER_URL=http://seaweedfs-filer:8888 \
+  -e IMAGE_BACKEND=seaweedfs_filer \
+  -e REQUIRE_AUTH=true \
+  -e MODEL_DEVICE=cpu \
+  -e LOG_FORMAT=json \
+  xplagiax:latest api
+
+# Worker
+docker run -d \
+  --name xplagiax-worker \
+  --network xplagiax-net \
+  --restart unless-stopped \
+  -e QDRANT_HOST=qdrant \
+  -e QDRANT_PORT=6333 \
+  -e REDIS_HOST=redis-server \
+  -e REDIS_PORT=6379 \
+  -e SEAWEEDFS_FILER_URL=http://seaweedfs-filer:8888 \
+  -e IMAGE_BACKEND=seaweedfs_filer \
+  -e SERVICE_NAME=xplagiax-worker \
+  -e REQUIRE_AUTH=false \
+  -e MODEL_DEVICE=cpu \
+  -e LOG_FORMAT=json \
+  xplagiax:latest worker
+
+```
 ---
 
 ## Usage Examples

@@ -290,6 +290,8 @@ docker run -d \
   --name xplagiax-worker \
   --network xplagiax-net \
   --restart unless-stopped \
+  -p 5010:5010 \
+  -e PORT=5010 \
   -e QDRANT_HOST=qdrant \
   -e QDRANT_PORT=6333 \
   -e REDIS_HOST=redis-server \

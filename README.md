@@ -264,16 +264,18 @@ curl http://localhost:6333/healthz
 ### 8 -  Internal DOKCER use
 ```bash
 cd xplagiax_image_service
-docker build -t xplagiax_is:latest .
+docker build -t xplagiax_image_service:latest .
 
 # API
 docker run -d \
-  --name xplagiax-api \
+  --name xplagiax_image_service \
   --network xplagiax-net \
   --restart unless-stopped \
-  -e SERVICE_API_KEY=mi_clave_super_secreta_aqui \
-  -e SERPAPI_KEY=tu_key_de_serpapi \
-  -e ZENSERP_KEY=tu_key_de_zenserp \
+  -p 5004:5004 \
+  -e PORT=5004 \
+  -e SERVICE_API_KEY=8f3c9b7d2a6e4f1c5d8a9b0e7f2c3d1a6b5e9f0c4d7a2b8c1e6f3d9a0b7c2e5f \
+  -e SERPAPI_KEY=18d0a89227e075bb1903ccf7453caff6205dc390687411edda0319d7066f58d0 \
+  -e ZENSERP_KEY=a9739160-ebe3-11f0-83d4-b9ca31f7dc25 \
   -e QDRANT_HOST=qdrant \
   -e QDRANT_PORT=6333 \
   -e REDIS_HOST=redis-server \
@@ -283,7 +285,7 @@ docker run -d \
   -e REQUIRE_AUTH=true \
   -e MODEL_DEVICE=cpu \
   -e LOG_FORMAT=json \
-  xplagiax:latest api
+  xplagiax_image_service:latest api
 
 # Worker
 docker run -d \
@@ -302,7 +304,6 @@ docker run -d \
   -e REQUIRE_AUTH=false \
   -e MODEL_DEVICE=cpu \
   -e LOG_FORMAT=json \
-  xplagiax:latest worker
 
 ```
 ---
@@ -734,7 +735,50 @@ curl http://localhost:5010/readyz
 curl http://localhost:9333/cluster/status
 curl http://localhost:6333/healthz
 ```
+  
+```
+cd xplagiax_image_service
+docker build -t xplagiax_image_service:latest .
 
+# API
+docker run -d \
+  --name xplagiax_image_service \
+  --network xplagiax-net \
+  --restart unless-stopped \
+  -p 5004:5004 \
+  -e PORT=5004 \
+  -e SERVICE_API_KEY=8f3c9b7d2a6e4f1c5d8a9b0e7f2c3d1a6b5e9f0c4d7a2b8c1e6f3d9a0b7c2e5f \
+  -e SERPAPI_KEY=18d0a89227e075bb1903ccf7453caff6205dc390687411edda0319d7066f58d0 \
+  -e ZENSERP_KEY=a9739160-ebe3-11f0-83d4-b9ca31f7dc25 \
+  -e QDRANT_HOST=qdrant \
+  -e QDRANT_PORT=6333 \
+  -e REDIS_HOST=redis-server \
+  -e REDIS_PORT=6379 \
+  -e SEAWEEDFS_FILER_URL=http://seaweedfs-filer:8888 \
+  -e IMAGE_BACKEND=seaweedfs_filer \
+  -e REQUIRE_AUTH=true \
+  -e MODEL_DEVICE=cpu \
+  -e LOG_FORMAT=json \
+  xplagiax_image_service:latest api
+
+# Worker
+docker run -d \
+  --name xplagiax-worker \
+  --network xplagiax-net \
+  --restart unless-stopped \
+  -p 5010:5010 \
+  -e PORT=5010 \
+  -e QDRANT_HOST=qdrant \
+  -e QDRANT_PORT=6333 \
+  -e REDIS_HOST=redis-server \
+  -e REDIS_PORT=6379 \
+  -e SEAWEEDFS_FILER_URL=http://seaweedfs-filer:8888 \
+  -e IMAGE_BACKEND=seaweedfs_filer \
+  -e SERVICE_NAME=xplagiax-worker \
+  -e REQUIRE_AUTH=false \
+  -e MODEL_DEVICE=cpu \
+  -e LOG_FORMAT=json \
+```
 ---
 
 ## Ejemplos de Uso

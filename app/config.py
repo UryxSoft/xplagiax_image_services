@@ -206,15 +206,7 @@ def load_config() -> AppConfig:
         job_ttl=_optional_int("REDIS_JOB_TTL", 3_600),
     )
 
-    import torch
     device = _optional("MODEL_DEVICE", "auto")
-    
-    # En ModelRegistry.__init__:
-    if device == "auto":
-        import torch
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        self._device = torch.device(device)
 
     model = ModelConfig(
         siglip_model_id=_optional(

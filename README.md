@@ -273,9 +273,9 @@ docker run -d \
   --restart unless-stopped \
   -p 5004:5004 \
   -e PORT=5004 \
-  -e SERVICE_API_KEY=8f3c9b7d2a6e4f1c5d8a9b0e7f2c3d1a6b5e9f0c4d7a2b8c1e6f3d9a0b7c2e5f \
-  -e SERPAPI_KEY=18d0a89227e075bb1903ccf7453caff6205dc390687411edda0319d7066f58d0 \
-  -e ZENSERP_KEY=a9739160-ebe3-11f0-83d4-b9ca31f7dc25 \
+  -e SERVICE_API_KEY=your_service_api_key_here \
+  -e SERPAPI_KEY=your_serpapi_key_here \
+  -e ZENSERP_KEY=your_zenserp_key_here \
   -e QDRANT_HOST=qdrant \
   -e QDRANT_PORT=6333 \
   -e REDIS_HOST=redis-server \
@@ -747,9 +747,9 @@ docker run -d \
   --restart unless-stopped \
   -p 5004:5004 \
   -e PORT=5004 \
-  -e SERVICE_API_KEY=8f3c9b7d2a6e4f1c5d8a9b0e7f2c3d1a6b5e9f0c4d7a2b8c1e6f3d9a0b7c2e5f \
-  -e SERPAPI_KEY=18d0a89227e075bb1903ccf7453caff6205dc390687411edda0319d7066f58d0 \
-  -e ZENSERP_KEY=a9739160-ebe3-11f0-83d4-b9ca31f7dc25 \
+  -e SERVICE_API_KEY=your_service_api_key_here \
+  -e SERPAPI_KEY=your_serpapi_key_here \
+  -e ZENSERP_KEY=your_zenserp_key_here \
   -e QDRANT_HOST=qdrant \
   -e QDRANT_PORT=6333 \
   -e REDIS_HOST=redis-server \

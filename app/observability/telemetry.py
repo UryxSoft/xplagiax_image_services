@@ -63,6 +63,11 @@ def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None
         level=getattr(logging, log_level, logging.INFO),
     )
 
+    # Suppress noisy third-party loggers
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("torch").setLevel(logging.ERROR)
+    logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+
 
 def get_logger(name: str) -> structlog.BoundLogger:
     return structlog.get_logger(name)

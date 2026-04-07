@@ -150,8 +150,11 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
     def _load_models_background():
         """Load models in a background thread so Flask starts immediately."""
         with app.app_context():
-            models.load_all()
-            logger.info("models_ready_serving_traffic")
+            try:
+                models.load_all()
+                logger.info("models_ready_serving_traffic")
+            except Exception as e:
+                logger.error("background_model_loader_failed", error=str(e))
 
     t = threading.Thread(target=_load_models_background, daemon=True, name="model-loader")
     t.start()

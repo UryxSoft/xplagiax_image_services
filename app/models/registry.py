@@ -23,6 +23,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from requests.exceptions import Timeout
 
 import numpy as np
 import torch
@@ -116,6 +117,12 @@ class ModelRegistry:
         start = time.perf_counter()
         try:
             logger.info("loading_clip_model", model_id=self._clip_model_id)
+
+            # SentenceTransformer relies on requests or huggingface_hub implicitly under the hood.
+            # Using environment variables to set a timeout for the downloads:
+            import os
+            os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
+
             self._clip = SentenceTransformer(
                 self._clip_model_id,
                 device=str(self._device),
@@ -150,6 +157,10 @@ class ModelRegistry:
         start = time.perf_counter()
         try:
             logger.info("loading_siglip_model", model_id=self._siglip_model_id)
+
+            import os
+            os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
+
             self._processor = AutoImageProcessor.from_pretrained(self._siglip_model_id)
             self._siglip = SiglipForImageClassification.from_pretrained(
                 self._siglip_model_id

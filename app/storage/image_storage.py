@@ -231,23 +231,6 @@ class SeaweedFSFilerStorage(ImageStorage):
         storage_key = self._build_path(content_hash, group_id, mime_type)
         url = self._url(storage_key)
 
-        # Idempotency: skip if identical file already exists
-        try:
-            head = self._session.head(url, timeout=self._timeout)
-            if head.status_code == 200:
-                remote_size = int(head.headers.get("Content-Length", 0))
-                if remote_size == len(image_bytes):
-                    logger.debug("seaweedfs_filer_skip_existing", storage_key=storage_key)
-                    return storage_key
-                logger.warning(
-                    "seaweedfs_filer_size_mismatch_overwriting",
-                    storage_key=storage_key,
-                    remote_size=remote_size,
-                    local_size=len(image_bytes),
-                )
-        except requests.RequestException:
-            pass  # HEAD failed — proceed with upload
-
         params = {}
         if self._replication:
             params["replication"] = self._replication

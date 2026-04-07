@@ -16,7 +16,7 @@ case "$MODE" in
 
   api)
     echo "[xplagiax] Starting API server (Gunicorn + gevent)"
-    echo "[xplagiax] Port: ${PORT:-5000} | Workers: ${WORKER_PROCESSES:-1}"
+    echo "[xplagiax] Port: ${PORT:-5004} | Workers: ${WORKER_PROCESSES:-1}"
     echo "[xplagiax] Qdrant: ${QDRANT_HOST}:${QDRANT_PORT}"
     echo "[xplagiax] Redis:  ${REDIS_HOST}:${REDIS_PORT}"
     echo "[xplagiax] Storage: ${IMAGE_BACKEND} → ${SEAWEEDFS_FILER_URL}"

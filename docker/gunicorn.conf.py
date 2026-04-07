@@ -27,7 +27,8 @@ import multiprocessing
 # --------------------------------------------------------------------------
 # Server socket
 # --------------------------------------------------------------------------
-bind = f"0.0.0.0:{os.getenv('PORT', '5004')}"
+PORT = int(os.getenv("PORT", "5004"))
+bind = f"0.0.0.0:{PORT}"
 backlog = 2048
 
 # --------------------------------------------------------------------------
@@ -85,7 +86,7 @@ limit_request_field_size = 8190
 # Hooks para logs con formato xplagiax
 def on_starting(server):
     print(f"[xplagiax] Starting API server (Gunicorn + gevent)")
-    print(f"[xplagiax] Port: {port} | Workers: {workers}")
+    print(f"[xplagiax] Port: {PORT} | Workers: {workers}")
     print(f"[xplagiax] Qdrant: {os.environ.get('QDRANT_HOST','qdrant')}:{os.environ.get('QDRANT_PORT','6333')}")
     print(f"[xplagiax] Redis:  {os.environ.get('REDIS_HOST','redis-server')}:{os.environ.get('REDIS_PORT','6379')}")
     print(f"[xplagiax] Storage: {os.environ.get('IMAGE_BACKEND','seaweedfs_filer')} → {os.environ.get('SEAWEEDFS_FILER_URL','')}")

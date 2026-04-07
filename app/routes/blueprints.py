@@ -32,6 +32,7 @@ from app.utils.image_validation import (
     sanitise_group_id,
     validate_and_load,
 )
+from app.utils.image_fetcher import fetch_image_bytes
 
 logger = get_logger(__name__)
 
@@ -56,27 +57,43 @@ def _svc(name: str):
     return current_app.extensions[f"xplagiax_{name}"]
 
 
-def _parse_image_upload(required: bool = True):
-    """Parse and validate uploaded image. Returns (image_bytes, pil_image, filename)."""
-    cfg = _svc("security_config")
+def _get_request_params() -> dict:
+    """Extract parameters from JSON or Form Data safely."""
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    return request.form.to_dict()
 
-    if "file" not in request.files:
+def _parse_image_upload(required: bool = True, params: Optional[dict] = None):
+    """
+    Parse and validate image from multiple sources: file upload, URL, or local path.
+    Returns (image_bytes, pil_image, filename, error_dict, status_code).
+    """
+    cfg = _svc("security_config")
+    params = params or _get_request_params()
+
+    file_upload = request.files.get("file")
+    image_url = params.get("image_url")
+    image_path = params.get("image_path")
+
+    if not any([file_upload, image_url, image_path]):
         if required:
-            return None, None, None, {"error": "No file uploaded", "code": "MISSING_FILE"}, 400
+            return None, None, None, {"error": "No image source provided (file, image_url, or image_path).", "code": "MISSING_FILE"}, 400
         return None, None, None, None, None
 
-    file = request.files["file"]
-    if not file.filename:
-        return None, None, None, {"error": "Empty filename", "code": "EMPTY_FILENAME"}, 400
-
     try:
-        image_bytes = file.read(cfg.max_image_bytes + 1)
+        image_bytes, raw_filename = fetch_image_bytes(
+            file_upload=file_upload,
+            image_url=image_url,
+            image_path=image_path,
+            max_bytes=cfg.max_image_bytes
+        )
+
         pil_image, mime_type = validate_and_load(
             image_bytes,
             max_bytes=cfg.max_image_bytes,
             allowed_mimes=cfg.allowed_mime_types,
         )
-        filename = sanitise_filename(file.filename)
+        filename = sanitise_filename(raw_filename)
         return image_bytes, pil_image, filename, None, None
     except ImageValidationError as exc:
         return None, None, None, {"error": str(exc), "code": "INVALID_IMAGE"}, 400
@@ -93,8 +110,8 @@ def upload_and_index():
     """
     Upload an image for indexing.
 
-    Form fields:
-      file              (required) image file
+    Form/JSON fields:
+      file | image_url | image_path (required)
       group_id          (optional) logical document group, default "default"
       page              (optional) page number within a document
       run_ai_detection  (optional) bool, default true
@@ -102,18 +119,19 @@ def upload_and_index():
 
     Returns 202 (async) or 200 (sync, degraded mode) with job info.
     """
-    image_bytes, pil_image, filename, err, code = _parse_image_upload()
+    params = _get_request_params()
+    image_bytes, pil_image, filename, err, code = _parse_image_upload(params=params)
     if err:
         return jsonify(err), code
 
-    group_id = sanitise_group_id(request.form.get("group_id", "default"))
-    page_raw = request.form.get("page")
-    page = int(page_raw) if page_raw and page_raw.isdigit() else None
-    run_ai = request.form.get("run_ai_detection", "true").lower() != "false"
+    group_id = sanitise_group_id(params.get("group_id", "default"))
+    page_raw = params.get("page")
+    page = int(page_raw) if page_raw and str(page_raw).isdigit() else None
+    run_ai = str(params.get("run_ai_detection", "true")).lower() != "false"
 
     extra = {
         k.removeprefix("extra_"): v
-        for k, v in request.form.items()
+        for k, v in params.items()
         if k.startswith("extra_")
     }
 
@@ -149,31 +167,52 @@ def upload_batch():
     Returns list of per-image results (or errors).
     Max 20 files per batch.
     """
+    params = _get_request_params()
     files = request.files.getlist("files")
-    if not files:
-        return jsonify({"error": "No files uploaded", "code": "MISSING_FILES"}), 400
-    if len(files) > 20:
+    image_urls = params.get("image_urls", [])
+    if isinstance(image_urls, str):
+        image_urls = [image_urls]
+    image_paths = params.get("image_paths", [])
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
+
+    total_items = len(files) + len(image_urls) + len(image_paths)
+
+    if total_items == 0:
+        return jsonify({"error": "No files, URLs or paths provided", "code": "MISSING_FILES"}), 400
+    if total_items > 20:
         return jsonify({
-            "error": "Maximum 20 files per batch",
+            "error": "Maximum 20 items per batch",
             "code": "BATCH_TOO_LARGE",
         }), 400
 
     cfg = _svc("security_config")
-    group_id = sanitise_group_id(request.form.get("group_id", "default"))
-    run_ai = request.form.get("run_ai_detection", "true").lower() != "false"
+    group_id = sanitise_group_id(params.get("group_id", "default"))
+    run_ai = str(params.get("run_ai_detection", "true")).lower() != "false"
     indexing = _svc("indexing")
 
     results = []
-    for file in files:
-        if not file.filename:
-            results.append({"error": "Empty filename", "code": "EMPTY_FILENAME"})
-            continue
+
+    def process_item(file_upload=None, url=None, path=None):
+        raw_name = "unknown"
+        if file_upload:
+            raw_name = file_upload.filename or "unknown"
+        elif url:
+            raw_name = url
+        elif path:
+            raw_name = path
+
         try:
-            raw = file.read(cfg.max_image_bytes + 1)
-            pil_image, _ = validate_and_load(raw, max_bytes=cfg.max_image_bytes)
-            filename = sanitise_filename(file.filename)
+            image_bytes, fetch_name = fetch_image_bytes(
+                file_upload=file_upload,
+                image_url=url,
+                image_path=path,
+                max_bytes=cfg.max_image_bytes
+            )
+            pil_image, _ = validate_and_load(image_bytes, max_bytes=cfg.max_image_bytes)
+            filename = sanitise_filename(fetch_name)
             result = indexing.submit(
-                image_bytes=raw,
+                image_bytes=image_bytes,
                 pil_image=pil_image,
                 filename=filename,
                 group_id=group_id,
@@ -182,18 +221,28 @@ def upload_batch():
             results.append(result)
         except ImageValidationError as exc:
             results.append({
-                "filename": sanitise_filename(file.filename or "unknown"),
+                "source": sanitise_filename(raw_name),
                 "error": str(exc),
                 "code": "INVALID_IMAGE",
             })
         except Exception as exc:
-            logger.error("batch_item_failed", file=file.filename, error=str(exc))
+            logger.error("batch_item_failed", source=raw_name, error=str(exc))
             results.append({
-                "filename": sanitise_filename(file.filename or "unknown"),
+                "source": sanitise_filename(raw_name),
                 "error": "Indexing failed",
                 "code": "INDEXING_ERROR",
                 "request_id": g.request_id,
             })
+
+    for file in files:
+        if not file.filename:
+            results.append({"source": "unknown", "error": "Empty filename", "code": "EMPTY_FILENAME"})
+            continue
+        process_item(file_upload=file)
+    for url in image_urls:
+        process_item(url=url)
+    for path in image_paths:
+        process_item(path=path)
 
     return jsonify({
         "total": len(results),
@@ -307,19 +356,20 @@ def search_similar():
     """
     Search for visually similar images.
 
-    Form fields:
-      file       (required) query image
+    Form/JSON fields:
+      file | image_url | image_path (required) query image
       limit      (optional) 1-50, default 10
       threshold  (optional) 0.0-1.0, default 0.0
       group_id   (optional) restrict search to a group
     """
-    image_bytes, pil_image, _, err, code = _parse_image_upload()
+    params = _get_request_params()
+    image_bytes, pil_image, _, err, code = _parse_image_upload(params=params)
     if err:
         return jsonify(err), code
 
-    limit = min(int(request.form.get("limit", 10)), 50)
-    threshold = float(request.form.get("threshold", 0.0))
-    group_id_raw = request.form.get("group_id")
+    limit = min(int(params.get("limit", 10)), 50)
+    threshold = float(params.get("threshold", 0.0))
+    group_id_raw = params.get("group_id")
     group_id = sanitise_group_id(group_id_raw) if group_id_raw else None
 
     try:
@@ -358,20 +408,21 @@ def analyze_plagiarism():
     """
     Plagiarism analysis — finds copies and modified versions.
 
-    Form fields:
-      file                  (required) image to analyze
+    Form/JSON fields:
+      file | image_url | image_path  (required) image to analyze
       similarity_threshold  (optional) default 0.90
       limit                 (optional) 1-20, default 5
       group_id              (optional) restrict to group
     """
-    image_bytes, pil_image, _, err, code = _parse_image_upload()
+    params = _get_request_params()
+    image_bytes, pil_image, _, err, code = _parse_image_upload(params=params)
     if err:
         return jsonify(err), code
 
-    threshold = float(request.form.get("similarity_threshold", 0.90))
+    threshold = float(params.get("similarity_threshold", 0.90))
     threshold = max(0.5, min(1.0, threshold))  # clamp to sensible range
-    limit = min(int(request.form.get("limit", 5)), 20)
-    group_id_raw = request.form.get("group_id")
+    limit = min(int(params.get("limit", 5)), 20)
+    group_id_raw = params.get("group_id")
     group_id = sanitise_group_id(group_id_raw) if group_id_raw else None
 
     try:
@@ -404,7 +455,8 @@ def analyze_ai_detection():
     Classify whether an image is AI-generated or human-created.
     Does NOT index the image.
     """
-    image_bytes, pil_image, _, err, code = _parse_image_upload()
+    params = _get_request_params()
+    image_bytes, pil_image, _, err, code = _parse_image_upload(params=params)
     if err:
         return jsonify(err), code
 
@@ -457,13 +509,17 @@ def patent_search_by_image():
             "code": "SERVICE_UNAVAILABLE",
         }), 503
 
-    image_url = request.form.get("image_url")
-    num_results = min(int(request.form.get("num_results", 10)), 50)
+    params = _get_request_params()
+    image_url = params.get("image_url")
+    num_results = min(int(params.get("num_results", 10)), 50)
 
-    if not image_url and "file" in request.files:
+    # Allow local paths and files to fallback to base64 usage.
+    # If image_url is a local path or external URL we shouldn't base64 it necessarily unless it's a file
+    # _parse_image_upload will handle path retrieval seamlessly.
+    if not image_url or "file" in request.files or params.get("image_path"):
         import base64
         # Safely validate the image without reading everything directly
-        raw, pil_image, _, err, code = _parse_image_upload(required=True)
+        raw, pil_image, _, err, code = _parse_image_upload(required=True, params=params)
         if err:
             return jsonify(err), code
         fmt = (pil_image.format or "jpeg").lower()
@@ -471,7 +527,7 @@ def patent_search_by_image():
         image_url = f"data:image/{fmt};base64,{b64}"
 
     if not image_url:
-        return jsonify({"error": "Provide 'file' or 'image_url'", "code": "MISSING_INPUT"}), 400
+        return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
 
     try:
         results = rotator.patent_image_search(image_url, num_results)
@@ -531,15 +587,14 @@ def reverse_image_search():
     if not rotator:
         return jsonify({"error": "Reverse search unavailable", "code": "SERVICE_UNAVAILABLE"}), 503
 
-    import base64, io as _io
-    from PIL import Image as PILImage
+    params = _get_request_params()
+    image_url = params.get("image_url")
+    num_results = min(int(params.get("num_results", 10)), 50)
 
-    image_url = request.form.get("image_url")
-    num_results = min(int(request.form.get("num_results", 10)), 50)
-
-    if not image_url and "file" in request.files:
+    if not image_url or "file" in request.files or params.get("image_path"):
+        import base64
         # Safely validate the image without reading everything directly
-        raw, pil_image, _, err, code = _parse_image_upload(required=True)
+        raw, pil_image, _, err, code = _parse_image_upload(required=True, params=params)
         if err:
             return jsonify(err), code
         fmt = (pil_image.format or "jpeg").lower()
@@ -547,7 +602,7 @@ def reverse_image_search():
         image_url = f"data:image/{fmt};base64,{b64}"
 
     if not image_url:
-        return jsonify({"error": "Provide 'file' or 'image_url'", "code": "MISSING_INPUT"}), 400
+        return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
 
     try:
         results = rotator.reverse_image_search(image_url, num_results)

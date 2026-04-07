@@ -33,7 +33,6 @@ backlog = 2048
 # --------------------------------------------------------------------------
 # Worker processes — see docstring above for reasoning
 # --------------------------------------------------------------------------
-bind = f"0.0.0.0:{port}"
 workers = int(os.getenv("WORKER_PROCESSES", "1"))
 worker_class = "gevent"
 worker_connections = 1000

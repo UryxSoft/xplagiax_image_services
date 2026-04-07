@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import io
 import re
-import struct
 from pathlib import Path
 from typing import Optional, Tuple
 

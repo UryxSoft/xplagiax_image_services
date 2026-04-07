@@ -27,12 +27,13 @@ import multiprocessing
 # --------------------------------------------------------------------------
 # Server socket
 # --------------------------------------------------------------------------
-bind = f"0.0.0.0:{os.getenv('PORT', '5000')}"
+bind = f"0.0.0.0:{os.getenv('PORT', '5004')}"
 backlog = 2048
 
 # --------------------------------------------------------------------------
 # Worker processes — see docstring above for reasoning
 # --------------------------------------------------------------------------
+bind = f"0.0.0.0:{port}"
 workers = int(os.getenv("WORKER_PROCESSES", "1"))
 worker_class = "gevent"
 worker_connections = 1000
@@ -59,7 +60,7 @@ access_log_format = (
 # --------------------------------------------------------------------------
 # Process naming
 # --------------------------------------------------------------------------
-proc_name = "xplagiax-api"
+proc_name = "xplagiax_image_services"
 
 # --------------------------------------------------------------------------
 # Server mechanics
@@ -82,8 +83,13 @@ limit_request_field_size = 8190
 # Hooks
 # --------------------------------------------------------------------------
 
+# Hooks para logs con formato xplagiax
 def on_starting(server):
-    server.log.info("Gunicorn starting — xplagiax API")
+    print(f"[xplagiax] Starting API server (Gunicorn + gevent)")
+    print(f"[xplagiax] Port: {port} | Workers: {workers}")
+    print(f"[xplagiax] Qdrant: {os.environ.get('QDRANT_HOST','qdrant')}:{os.environ.get('QDRANT_PORT','6333')}")
+    print(f"[xplagiax] Redis:  {os.environ.get('REDIS_HOST','redis-server')}:{os.environ.get('REDIS_PORT','6379')}")
+    print(f"[xplagiax] Storage: {os.environ.get('IMAGE_BACKEND','seaweedfs_filer')} → {os.environ.get('SEAWEEDFS_FILER_URL','')}")
 
 
 def worker_exit(server, worker):

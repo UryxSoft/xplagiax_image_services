@@ -78,11 +78,15 @@ def _init_worker():
     _storage = create_storage(
         backend=cfg.storage.image_backend,
         local_base_path=cfg.storage.local_base_path,
-        s3_bucket=cfg.storage.s3_bucket,
-        s3_region=cfg.storage.s3_region,
-        s3_endpoint_url=cfg.storage.s3_endpoint_url,
-        s3_access_key=cfg.storage.s3_access_key,
-        s3_secret_key=cfg.storage.s3_secret_key,
+        seaweedfs_filer_url=cfg.storage.seaweedfs_filer_url,
+        seaweedfs_public_url=cfg.storage.seaweedfs_public_url,
+        seaweedfs_replication=cfg.storage.seaweedfs_replication,
+        seaweedfs_collection=cfg.storage.seaweedfs_collection,
+        seaweedfs_ttl=cfg.storage.seaweedfs_ttl,
+        seaweedfs_request_timeout=cfg.storage.seaweedfs_request_timeout,
+        seaweedfs_max_retries=cfg.storage.seaweedfs_max_retries,
+        seaweedfs_master_url=cfg.storage.seaweedfs_master_url,
+        seaweedfs_public_volume_url=cfg.storage.seaweedfs_public_volume_url,
     )
 
     _repo = VectorRepository(

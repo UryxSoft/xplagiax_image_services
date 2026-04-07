@@ -229,7 +229,8 @@ _metrics: Optional[Metrics] = None
 
 def init_metrics(service_name: str) -> Metrics:
     global _metrics
-    _metrics = Metrics(service_name)
+    if _metrics is None:
+        _metrics = Metrics(service_name)
     return _metrics
 
 

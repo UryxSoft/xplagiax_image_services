@@ -219,7 +219,7 @@ COPY docker/entrypoint.sh ./entrypoint.sh
 # entrypoint.sh is copied as root then ownership is set
 # The USER directive above applies, so we need to set exec bit
 USER root
-RUN chmod +x /app/entrypoint.sh && chown xplagiax_image_services:xplagiax_image_services /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && chown xplagiax:xplagiax /app/entrypoint.sh
 USER xplagiax
 
 ENTRYPOINT ["/app/entrypoint.sh"]

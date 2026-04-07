@@ -69,7 +69,14 @@ def rate_limit(f):
     def decorated(*args, **kwargs):
         cfg = _get_security_config()
         cache = _get_cache()
-
+        # FIX: fail-closed, no fail-open
+        if not (cache and cache.available):
+            logger.warning("rate_limit_bypassed_redis_unavailable")
+            return jsonify({
+                "error": "Service temporarily unavailable",
+                "code": "RATE_LIMIT_UNAVAILABLE"
+            }), 503
+          
         if cache and cache.available:
             client_ip = _get_client_ip()
             now = int(time.time())

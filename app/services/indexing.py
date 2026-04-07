@@ -198,9 +198,11 @@ class IndexingService:
 
         self._queue.enqueue(
             "app.workers.ml_worker.process_index_job",
-            job_id=job_id,
-            **job_kwargs,
-            job_id_override=job_id,
+            kwargs={
+                "job_id": job_id,
+                **job_kwargs,
+            },
+            job_id=job_id,   
             job_timeout=120,
             result_ttl=3600,
             failure_ttl=3600,

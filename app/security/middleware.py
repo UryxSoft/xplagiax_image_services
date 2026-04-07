@@ -203,13 +203,14 @@ def register_error_handlers(app: Flask) -> None:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
+TRUSTED_PROXIES = {"127.0.0.1", "10.0.0.0/8"}
 def _get_client_ip() -> str:
-    """Extract real client IP, respecting X-Forwarded-For from trusted proxies."""
-    xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.remote_addr or "unknown"
+    remote = request.remote_addr
+    if remote in TRUSTED_PROXIES:
+        xff = request.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return remote or "unknown"
 
 
 def _get_security_config():

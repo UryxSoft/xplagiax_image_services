@@ -36,7 +36,6 @@ def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.ExceptionRenderer(),

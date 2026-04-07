@@ -255,7 +255,7 @@ def get_image_url(point_id: str):
     if not storage_key:
         return jsonify({"error": "No storage reference", "code": "MISSING_STORAGE_KEY"}), 404
 
-    url = storage.get_url(storage_key, expiry_seconds=cfg_storage.presigned_url_expiry_s)
+    url = storage.get_url(storage_key, expiry_seconds=3600)
     return jsonify({
         "point_id": point_id,
         "url": url,

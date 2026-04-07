@@ -139,7 +139,7 @@ ENV PYTHONUNBUFFERED=1 \
     \
     # Flask
     FLASK_DEBUG=false \
-    PORT=5000 \
+    PORT=5004 \
     WORKER_PROCESSES=1 \
     LOG_LEVEL=INFO \
     LOG_FORMAT=json \
@@ -191,7 +191,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # ----------------------------------------------------------
 # Exposed ports
-#   5000  → Flask API (Gunicorn)
+#   5004  → Flask API (Gunicorn)
 #   9090  → Prometheus metrics
 # ----------------------------------------------------------
 EXPOSE 5004 9090

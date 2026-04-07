@@ -44,7 +44,7 @@ Built to run at scale: async ML inference, distributed object storage via Seawee
                                        │
                         ┌──────────────▼──────────────────┐
                         │   Flask API  (Gunicorn + gevent)│
-                        │   workers=1 · port 5000         │
+                        │   workers=1 · port 5004         │
                         └──────┬───────────────┬──────────┘
                                │               │
                ┌───────────────▼──┐     ┌──────▼──────────────┐
@@ -154,7 +154,7 @@ All endpoints require `X-API-Key: <your-key>` header (or `Authorization: Bearer 
 ```
 Service             Image                          Port(s)
 ─────────────────── ────────────────────────────── ──────────────
-xplagiax API        xplagiax:latest                5000, 9090
+xplagiax API        xplagiax:latest                5004, 9090
 xplagiax Worker     xplagiax:latest                —
 Qdrant              qdrant/qdrant:v1.10.1          6333, 6334
 Redis               redis:7.2-alpine               6379
@@ -562,7 +562,7 @@ Diseñado para escalar: inferencia ML asíncrona, almacenamiento distribuido via
                                        │
                         ┌──────────────▼──────────────────┐
                         │  Flask API  (Gunicorn + gevent)  │
-                        │  workers=1 · puerto 5000         │
+                        │  workers=1 · puerto 5004         │
                         └──────┬───────────────┬──────────┘
                                │               │
                ┌───────────────▼──┐     ┌──────▼──────────────┐

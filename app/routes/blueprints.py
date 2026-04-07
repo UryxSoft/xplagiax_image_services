@@ -544,7 +544,11 @@ def reverse_image_search():
     num_results = min(int(request.form.get("num_results", 10)), 50)
 
     if not image_url and "file" in request.files:
-        raw = request.files["file"].read()
+        # FIX:
+        cfg = _svc("security_config")
+        raw = request.files["file"].read(cfg.max_image_bytes + 1)
+        if len(raw) > cfg.max_image_bytes:
+            return jsonify({"error": "File too large"}), 413
         try:
             img = PILImage.open(_io.BytesIO(raw))
             fmt = (img.format or "jpeg").lower()

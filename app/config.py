@@ -207,11 +207,14 @@ def load_config() -> AppConfig:
     )
 
     import torch
-    raw_device = _optional("MODEL_DEVICE", "auto")
-    if raw_device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _optional("MODEL_DEVICE", "auto")
+    
+    # En ModelRegistry.__init__:
+    if device == "auto":
+        import torch
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
-        device = raw_device
+        self._device = torch.device(device)
 
     model = ModelConfig(
         siglip_model_id=_optional(

@@ -310,7 +310,7 @@ docker run -d \
 
 ## Usage Examples
 
-### Upload an image
+### Upload an image (Local File)
 
 ```bash
 curl -X POST http://localhost:5010/api/v1/images \
@@ -320,7 +320,25 @@ curl -X POST http://localhost:5010/api/v1/images \
   -F "run_ai_detection=true"
 ```
 
-### Search for similar images
+### Upload an image (Remote URL via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/images \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/photo.jpg", "group_id": "project_x"}'
+```
+
+### Upload an image (Server Absolute Path via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/images \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"image_path": "/var/data/ingest/photo.jpg", "group_id": "project_x"}'
+```
+
+### Search for similar images (Local File)
 
 ```bash
 curl -X POST http://localhost:5010/api/v1/search/similar \
@@ -330,13 +348,31 @@ curl -X POST http://localhost:5010/api/v1/search/similar \
   -F "limit=10"
 ```
 
-### Plagiarism analysis
+### Search for similar images (Remote URL via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/search/similar \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/query.jpg", "threshold": 0.80, "limit": 10}'
+```
+
+### Search for similar images (Server Absolute Path via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/search/similar \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"image_path": "/var/data/ingest/query.jpg", "threshold": 0.80, "limit": 10}'
+```
+
+### Plagiarism analysis (via JSON URL)
 
 ```bash
 curl -X POST http://localhost:5010/api/v1/search/plagiarism \
   -H "X-API-Key: your-secret-key" \
-  -F "file=@suspect.jpg" \
-  -F "similarity_threshold=0.90"
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/suspect.jpg", "similarity_threshold": 0.90}'
 ```
 
 **Response:**
@@ -362,12 +398,30 @@ curl -X POST http://localhost:5010/api/v1/search/plagiarism \
 }
 ```
 
-### Detect AI-generated image
+### Detect AI-generated image (Local File)
 
 ```bash
 curl -X POST http://localhost:5010/api/v1/search/ai-detection \
   -H "X-API-Key: your-secret-key" \
   -F "file=@image.png"
+```
+
+### Detect AI-generated image (Remote URL via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/search/ai-detection \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/image.png"}'
+```
+
+### Reverse Image Search (via JSON URL)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/patents/reverse-image \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/image.png", "num_results": 10}'
 ```
 
 **Response:**
@@ -783,7 +837,7 @@ docker run -d \
 
 ## Ejemplos de Uso
 
-### Subir una imagen
+### Subir una imagen (Archivo Local)
 
 ```bash
 curl -X POST http://localhost:5010/api/v1/images \
@@ -793,21 +847,75 @@ curl -X POST http://localhost:5010/api/v1/images \
   -F "run_ai_detection=true"
 ```
 
-### Análisis de plagio
+### Subir una imagen (URL Remota via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/images \
+  -H "X-API-Key: tu-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://ejemplo.com/foto.jpg", "group_id": "proyecto_x"}'
+```
+
+### Subir una imagen (Ruta Absoluta del Servidor via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/images \
+  -H "X-API-Key: tu-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"image_path": "/var/data/ingest/foto.jpg", "group_id": "proyecto_x"}'
+```
+
+### Buscar imágenes visualmente similares (URL Remota via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/search/similar \
+  -H "X-API-Key: tu-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://ejemplo.com/query.jpg", "threshold": 0.80, "limit": 10}'
+```
+
+### Buscar imágenes visualmente similares (Ruta Absoluta del Servidor via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/search/similar \
+  -H "X-API-Key: tu-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"image_path": "/var/data/ingest/query.jpg", "threshold": 0.80, "limit": 10}'
+```
+
+### Análisis de plagio (via JSON URL)
 
 ```bash
 curl -X POST http://localhost:5010/api/v1/search/plagiarism \
   -H "X-API-Key: tu-clave-secreta" \
-  -F "file=@sospechosa.jpg" \
-  -F "similarity_threshold=0.90"
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://ejemplo.com/sospechosa.jpg", "similarity_threshold": 0.90}'
 ```
 
-### Detectar imagen generada por IA
+### Detectar imagen generada por IA (Archivo Local)
 
 ```bash
 curl -X POST http://localhost:5010/api/v1/search/ai-detection \
   -H "X-API-Key: tu-clave-secreta" \
   -F "file=@imagen.png"
+```
+
+### Detectar imagen generada por IA (URL Remota via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/search/ai-detection \
+  -H "X-API-Key: tu-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://ejemplo.com/imagen.png"}'
+```
+
+### Búsqueda Inversa de Imagen (URL Remota via JSON)
+
+```bash
+curl -X POST http://localhost:5010/api/v1/patents/reverse-image \
+  -H "X-API-Key: tu-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://ejemplo.com/imagen.png", "num_results": 10}'
 ```
 
 ---

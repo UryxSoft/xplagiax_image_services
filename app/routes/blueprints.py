@@ -461,18 +461,12 @@ def patent_search_by_image():
     num_results = min(int(request.form.get("num_results", 10)), 50)
 
     if not image_url and "file" in request.files:
-        import base64, io as _io
-        from PIL import Image as PILImage
-        # FIX:
-        cfg = _svc("security_config")
-        raw = request.files["file"].read(cfg.max_image_bytes + 1)
-        if len(raw) > cfg.max_image_bytes:
-            return jsonify({"error": "File too large"}), 413
-        try:
-            img = PILImage.open(_io.BytesIO(raw))
-            fmt = (img.format or "jpeg").lower()
-        except Exception:
-            fmt = "jpeg"
+        import base64
+        # Safely validate the image without reading everything directly
+        raw, pil_image, _, err, code = _parse_image_upload(required=True)
+        if err:
+            return jsonify(err), code
+        fmt = (pil_image.format or "jpeg").lower()
         b64 = base64.b64encode(raw).decode()
         image_url = f"data:image/{fmt};base64,{b64}"
 
@@ -544,17 +538,13 @@ def reverse_image_search():
     num_results = min(int(request.form.get("num_results", 10)), 50)
 
     if not image_url and "file" in request.files:
-        # FIX:
-        cfg = _svc("security_config")
-        raw = request.files["file"].read(cfg.max_image_bytes + 1)
-        if len(raw) > cfg.max_image_bytes:
-            return jsonify({"error": "File too large"}), 413
-        try:
-            img = PILImage.open(_io.BytesIO(raw))
-            fmt = (img.format or "jpeg").lower()
-        except Exception:
-            fmt = "jpeg"
-        image_url = f"data:image/{fmt};base64,{base64.b64encode(raw).decode()}"
+        # Safely validate the image without reading everything directly
+        raw, pil_image, _, err, code = _parse_image_upload(required=True)
+        if err:
+            return jsonify(err), code
+        fmt = (pil_image.format or "jpeg").lower()
+        b64 = base64.b64encode(raw).decode()
+        image_url = f"data:image/{fmt};base64,{b64}"
 
     if not image_url:
         return jsonify({"error": "Provide 'file' or 'image_url'", "code": "MISSING_INPUT"}), 400

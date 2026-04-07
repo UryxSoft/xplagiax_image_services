@@ -38,7 +38,7 @@ services:
     networks:
       - xplagiax-net
     ports:
-      - "5010:5000"
+      - "5010:5004"
       - "9090:9090"
     env_file:
       - ../.env
@@ -54,7 +54,7 @@ services:
     volumes:
       - hf_cache:/app/.cache/huggingface
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/healthz"]
+      test: ["CMD", "curl", "-f", "http://localhost:5004/healthz"]
       interval: 30s
       timeout: 5s
       start_period: 90s

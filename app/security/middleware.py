@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import functools
+import hmac
 import time
 import uuid
 from typing import Optional
@@ -45,7 +46,7 @@ def require_auth(f):
             request.headers.get("X-API-Key")
             or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
         )
-        if not provided_key or provided_key != cfg.api_key:
+        if not provided_key or not hmac.compare_digest(provided_key, cfg.api_key):
             logger.warning(
                 "auth_failed",
                 remote_addr=_get_client_ip(),
@@ -69,14 +70,11 @@ def rate_limit(f):
     def decorated(*args, **kwargs):
         cfg = _get_security_config()
         cache = _get_cache()
-        # FIX: fail-closed, no fail-open
+        # Fail-open: graceful degradation if Redis is down
         if not (cache and cache.available):
             logger.warning("rate_limit_bypassed_redis_unavailable")
-            return jsonify({
-                "error": "Service temporarily unavailable",
-                "code": "RATE_LIMIT_UNAVAILABLE"
-            }), 503
-          
+            return f(*args, **kwargs)
+
         if cache and cache.available:
             client_ip = _get_client_ip()
             now = int(time.time())

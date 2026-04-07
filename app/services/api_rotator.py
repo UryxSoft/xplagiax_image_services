@@ -81,11 +81,13 @@ class ProviderScore:
     error_window: collections.deque = field(
         default_factory=lambda: collections.deque(maxlen=10)  # last 10: True=error
     )
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def record(self, success: bool, response_ms: float) -> None:
-        self.error_window.append(not success)
-        self.response_times.append(response_ms)
-        self._recalculate()
+        with self._lock:
+            self.error_window.append(not success)
+            self.response_times.append(response_ms)
+            self._recalculate()
 
     def penalise(self, duration_seconds: int = 3600) -> None:
         self.penalty_until = datetime.datetime.utcnow() + datetime.timedelta(
@@ -167,16 +169,18 @@ class UsageTracker:
             try:
                 with open(self._usage_file, "a+") as f:
                     fcntl.flock(f, fcntl.LOCK_EX)
-                    f.seek(0)
-                    raw = f.read()
-                    data = json.loads(raw) if raw.strip() else {}
-                    key = f"{provider}:{ym}"
-                    data[key] = data.get(key, 0) + 1
-                    f.seek(0)
-                    f.truncate()
-                    json.dump(data, f)
-                    fcntl.flock(f, fcntl.LOCK_UN)
-                    return data[key]
+                    try:
+                        f.seek(0)
+                        raw = f.read()
+                        data = json.loads(raw) if raw.strip() else {}
+                        key = f"{provider}:{ym}"
+                        data[key] = data.get(key, 0) + 1
+                        f.seek(0)
+                        f.truncate()
+                        json.dump(data, f)
+                        return data[key]
+                    finally:
+                        fcntl.flock(f, fcntl.LOCK_UN)
             except Exception as exc:
                 logger.warning("usage_file_write_failed", error=str(exc))
                 return 0

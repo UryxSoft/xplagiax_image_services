@@ -161,6 +161,8 @@ class ModelRegistry:
             import os
             os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
 
+            # Temporary fix: ensure trusting remote code if necessary
+            # or downloading specific safe versions of the models.
             self._processor = AutoImageProcessor.from_pretrained(self._siglip_model_id)
             self._siglip = SiglipForImageClassification.from_pretrained(
                 self._siglip_model_id

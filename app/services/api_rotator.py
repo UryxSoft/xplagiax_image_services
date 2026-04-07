@@ -315,6 +315,62 @@ class SmartApiRotator:
         )
         return response.json()
 
+    def _extract_image_sources(self, response_data: dict) -> list:
+        """
+        Extract direct image URLs and related sources from a SerpApi or ZenSerp reverse image search response.
+        Google Reverse Image Search JSON structure typically hides matches under:
+        - `image_results` (ZenSerp / older SerpApi)
+        - `visual_matches` (SerpApi new format)
+        - `inline_images`
+        - `knowledge_graph` (identifications)
+        """
+        extracted = []
+
+        # 1. Look for 'visual_matches' (SerpApi standard for identical / visually similar)
+        if "visual_matches" in response_data:
+            for item in response_data["visual_matches"]:
+                if "link" in item:
+                    extracted.append({
+                        "title": item.get("title", ""),
+                        "source": item.get("source", ""),
+                        "url": item["link"],
+                        "thumbnail": item.get("thumbnail", "")
+                    })
+
+        # 2. Look for 'image_results' (Fallback for ZenSerp or legacy Google Images)
+        if "image_results" in response_data:
+            for item in response_data["image_results"]:
+                # Often ZenSerp uses 'sourceUrl' or SerpApi uses 'link'
+                url = item.get("link") or item.get("sourceUrl")
+                if url:
+                    extracted.append({
+                        "title": item.get("title", ""),
+                        "source": item.get("source", ""),
+                        "url": url,
+                        "thumbnail": item.get("thumbnail", "")
+                    })
+
+        # 3. Look for 'inline_images'
+        if "inline_images" in response_data:
+            for item in response_data["inline_images"]:
+                if "link" in item:
+                    extracted.append({
+                        "title": item.get("title", "Inline Image"),
+                        "source": item.get("source", ""),
+                        "url": item["link"],
+                        "thumbnail": item.get("thumbnail", "")
+                    })
+
+        # Remove duplicates by URL
+        seen = set()
+        unique_extracted = []
+        for item in extracted:
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                unique_extracted.append(item)
+
+        return unique_extracted
+
     def _execute_with_fallback(self, build_params: Callable[[str], tuple[str, dict]]) -> dict:
         """
         Try providers in score order. On failure, try next provider.
@@ -379,7 +435,15 @@ class SmartApiRotator:
                 )
             raise ValueError(f"Unknown provider: {provider}")
 
-        return self._execute_with_fallback(build)
+        response_data = self._execute_with_fallback(build)
+
+        # Inject our extracted sources to make the response robust and friendly
+        # Since standard JSON from Google is deeply nested
+        extracted_sources = self._extract_image_sources(response_data)
+        if extracted_sources:
+            response_data["extracted_visual_matches"] = extracted_sources[:num_results]
+
+        return response_data
 
     def patent_text_search(self, query: str, num_results: int = 10) -> dict:
         def build(provider: str) -> tuple[str, dict]:
@@ -413,10 +477,16 @@ class SmartApiRotator:
         Counts as 2 API calls.
         """
         reverse = self.reverse_image_search(image_url, num_results=3)
-        keywords = " ".join(
-            r.get("title", "")
-            for r in (reverse.get("image_results") or [])[:3]
-        ).strip()
+
+        # Try to extract keywords from our robust extraction first
+        if "extracted_visual_matches" in reverse and reverse["extracted_visual_matches"]:
+            keywords = " ".join(r.get("title", "") for r in reverse["extracted_visual_matches"][:3]).strip()
+        else:
+            # Fallback to standard
+            keywords = " ".join(
+                r.get("title", "")
+                for r in (reverse.get("image_results") or reverse.get("visual_matches") or [])[:3]
+            ).strip()
 
         if not keywords:
             raise ValueError(

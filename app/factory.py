@@ -55,19 +55,20 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
     # 1. Logging — must be first                                          #
     # ------------------------------------------------------------------ #
     # We configure with defaults here; reconfigure once config is loaded
-    configure_logging(log_level="INFO", log_format="json")
-    logger = get_logger(__name__)
+    #configure_logging(log_level="INFO", log_format="json")
+    #logger = get_logger(__name__)
 
     # ------------------------------------------------------------------ #
     # 2. Configuration                                                    #
     # ------------------------------------------------------------------ #
     if config is None:
         config = load_config()
-
-    configure_logging(
-        log_level=config.observability.log_level,
-        log_format=config.observability.log_format,
-    )
+    configure_logging(config.observability.log_level, config.observability.log_format)
+    logger = get_logger(__name__)
+    #configure_logging(
+    #    log_level=config.observability.log_level,
+    #    log_format=config.observability.log_format,
+    #)
     logger.info(
         "app_starting",
         service=config.observability.service_name,

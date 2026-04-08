@@ -42,7 +42,7 @@ def fetch_image_bytes(
             raise ImageValidationError("Invalid URL scheme. Only HTTP/HTTPS allowed.")
 
         try:
-            with requests.get(image_url, stream=True, timeout=10.0) as resp:
+            with requests.get(image_url, stream=True, timeout=5.0) as resp:
                 resp.raise_for_status()
 
                 # Check Content-Length header if available

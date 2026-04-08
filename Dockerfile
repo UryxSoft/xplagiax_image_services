@@ -85,6 +85,16 @@ COPY app/         ./app/
 COPY docker/gunicorn.conf.py ./gunicorn.conf.py
 
 # ----------------------------------------------------------
+# Directories and permissions
+# ----------------------------------------------------------
+RUN mkdir -p \
+        /app/.cache/huggingface \
+        /tmp/xplagiax \
+    && chown -R xplagiax:xplagiax /app /tmp/xplagiax
+
+USER xplagiax
+
+# ----------------------------------------------------------
 # HuggingFace model pre-download (optional build arg)
 #
 # By default DOWNLOAD_MODELS=false — models are downloaded
@@ -103,7 +113,7 @@ ARG HF_HOME=/app/.cache/huggingface
 ENV HF_HOME=${HF_HOME} \
     TRANSFORMERS_CACHE=${HF_HOME}
 
-COPY docker/download_models.py /tmp/download_models.py
+COPY --chown=xplagiax:xplagiax docker/download_models.py /tmp/download_models.py
 
 RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
         echo "Downloading HuggingFace models into image..." && \
@@ -111,31 +121,6 @@ RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
     else \
         echo "DOWNLOAD_MODELS=false — models will be downloaded on first start"; \
     fi
-#RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
-#        echo "Downloading HuggingFace models into image..." && \
-#        python -c " \
-#from transformers import AutoImageProcessor, SiglipForImageClassification; \
-#from sentence_transformers import SentenceTransformer; \
-#print('Downloading SigLIP...'); \
-#AutoImageProcessor.from_pretrained('Ateeqq/ai-vs-human-image-detector'); \
-#SiglipForImageClassification.from_pretrained('Ateeqq/ai-vs-human-image-detector'); \
-#print('Downloading CLIP...'); \
-#SentenceTransformer('clip-ViT-B-32'); \
-#print('All models downloaded.'); \
-#"; \
-#    else \
-#        echo "DOWNLOAD_MODELS=false — models will be downloaded on first start"; \
-#    fi
-
-# ----------------------------------------------------------
-# Directories and permissions
-# ----------------------------------------------------------
-RUN mkdir -p \
-        /app/.cache/huggingface \
-        /tmp/xplagiax \
-    && chown -R xplagiax:xplagiax /app /tmp/xplagiax
-
-USER xplagiax
 
 # ----------------------------------------------------------
 # Environment defaults

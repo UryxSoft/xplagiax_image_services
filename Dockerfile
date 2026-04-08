@@ -180,7 +180,7 @@ ENV PYTHONUNBUFFERED=1 \
     \
     # ML Models
     SIGLIP_MODEL_ID=Ateeqq/ai-vs-human-image-detector \
-    CLIP_MODEL_ID=clip-ViT-B-32 \
+    CLIP_MODEL_ID=sentence-transformers/clip-ViT-B-32 \
     MODEL_DEVICE=auto \
     MODEL_MAX_BATCH_SIZE=32 \
     \

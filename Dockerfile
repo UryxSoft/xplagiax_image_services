@@ -97,7 +97,7 @@ COPY docker/gunicorn.conf.py ./gunicorn.conf.py
 # Build with models baked in:
 #   docker build --build-arg DOWNLOAD_MODELS=true -t xplagiax:models .
 # ----------------------------------------------------------
-ARG DOWNLOAD_MODELS=false
+ARG DOWNLOAD_MODELS=true 
 ARG HF_HOME=/app/.cache/huggingface
 
 ENV HF_HOME=${HF_HOME} \

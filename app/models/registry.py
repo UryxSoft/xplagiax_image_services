@@ -85,6 +85,8 @@ class ModelRegistry:
     ) -> None:
         self._siglip_model_id = siglip_model_id
         self._clip_model_id = clip_model_id
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = torch.device(device)
         self._max_batch_size = max_batch_size
 

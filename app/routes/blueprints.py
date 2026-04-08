@@ -463,11 +463,17 @@ def analyze_ai_detection():
     try:
         models = _svc("models")
         if not models.siglip_ready:
-            return jsonify({
-                "error": "AI detection model not available",
-                "code": "MODEL_NOT_READY",
-                "detail": models.get_status()["siglip"]["error"],
-            }), 503
+            if models.is_siglip_loading():
+                return jsonify({
+                    "error": "Cargando modelo, intente de nuevo",
+                    "code": "MODEL_LOADING"
+                }), 503
+            else:
+                return jsonify({
+                    "error": "AI detection model not available",
+                    "code": "MODEL_NOT_READY",
+                    "detail": models.get_status()["siglip"]["error"],
+                }), 503
 
         result = models.classify_single(pil_image)
         return jsonify({

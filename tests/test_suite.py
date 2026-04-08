@@ -333,6 +333,7 @@ class TestApiRoutes(unittest.TestCase):
             ApiRotatorConfig, SecurityConfig, StorageConfig, ObservabilityConfig
         )
 
+        import dataclasses
         # Build minimal test config
         test_config = AppConfig(
             qdrant=QdrantConfig(
@@ -364,8 +365,10 @@ class TestApiRoutes(unittest.TestCase):
             ),
             storage=StorageConfig(
                 image_backend="local", local_base_path="/tmp/test_images",
-                s3_bucket=None, s3_region="us-east-1", s3_endpoint_url=None,
-                s3_access_key=None, s3_secret_key=None, presigned_url_expiry_s=3600,
+                seaweedfs_replication="000", seaweedfs_collection="", seaweedfs_ttl="",
+                seaweedfs_request_timeout=5.0, seaweedfs_max_retries=3,
+                seaweedfs_filer_url=None, seaweedfs_public_url=None,
+                seaweedfs_master_url=None, seaweedfs_public_volume_url=None
             ),
             observability=ObservabilityConfig(
                 log_level="ERROR", log_format="text",
@@ -385,8 +388,7 @@ class TestApiRoutes(unittest.TestCase):
             patch("app.storage.vector_repository.VectorRepository.health_check",
                   return_value={"status": "ok"}),
             patch("app.storage.vector_repository.VectorRepository.stats",
-                  return_value=MagicMock(total_vectors=0, indexed_vectors_count=0,
-                                        collection_name="test", status="green")),
+                  return_value=dataclasses.make_dataclass('Stats', [('total_vectors', int), ('indexed_vectors_count', int), ('collection_name', str), ('status', str)])(0, 0, "test", "green")),
             patch("app.cache.redis_client.CacheClient.__init__", return_value=None),
             patch("app.cache.redis_client.CacheClient.available", new_callable=PropertyMock,
                   return_value=False),

@@ -353,6 +353,9 @@ class ModelRegistry:
     def siglip_ready(self) -> bool:
         return self._siglip is not None
 
+    def is_siglip_loading(self) -> bool:
+        return not self._siglip_status.loaded and self._siglip_status.error is None
+
     def get_status(self) -> dict:
         return {
             "clip": {

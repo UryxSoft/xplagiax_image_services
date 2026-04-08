@@ -253,6 +253,11 @@ class ModelRegistry:
                     )
                 )
 
+            del batch
+            del embeddings
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         logger.info(
             "clip_inference_complete",
             images=len(images),
@@ -328,6 +333,13 @@ class ModelRegistry:
                         duration_ms=elapsed_ms / len(batch),
                     )
                 )
+
+            del batch
+            del inputs
+            del outputs
+            del probs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return results
 

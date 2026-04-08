@@ -522,20 +522,23 @@ def patent_search_by_image():
     # Allow local paths and files to fallback to base64 usage.
     # If image_url is a local path or external URL we shouldn't base64 it necessarily unless it's a file
     # _parse_image_upload will handle path retrieval seamlessly.
-    if not image_url or "file" in request.files or params.get("image_path"):
-        import base64
-        # Safely validate the image without reading everything directly
-        raw, pil_image, _, err, code = _parse_image_upload(required=True, params=params)
-        if err:
-            return jsonify(err), code
-        fmt = (pil_image.format or "jpeg").lower()
-        b64 = base64.b64encode(raw).decode()
-        image_url = f"data:image/{fmt};base64,{b64}"
-
-    if not image_url:
-        return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
-
     try:
+        if not image_url or "file" in request.files or params.get("image_path"):
+            import base64
+            # Safely validate the image without reading everything directly
+            raw, pil_image, _, err, code = _parse_image_upload(required=True, params=params)
+            if err:
+                return jsonify(err), code
+            fmt = (pil_image.format or "jpeg").lower()
+            b64 = base64.b64encode(raw).decode()
+            image_url = f"data:image/{fmt};base64,{b64}"
+
+            # Explicitly free memory for large variables
+            del raw, pil_image, b64
+
+        if not image_url:
+            return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
+
         results = rotator.patent_image_search(image_url, num_results)
         return jsonify({
             "status": "success",
@@ -543,7 +546,7 @@ def patent_search_by_image():
             "usage": rotator.get_usage_status(),
         }), 200
     except Exception as exc:
-        logger.error("patent_image_search_failed", error=str(exc))
+        logger.error("patent_image_search_failed", error=str(exc), exc_info=True)
         return jsonify({"error": str(exc), "code": "PATENT_SEARCH_ERROR"}), 500
 
 
@@ -597,20 +600,23 @@ def reverse_image_search():
     image_url = params.get("image_url")
     num_results = min(int(params.get("num_results", 10)), 50)
 
-    if not image_url or "file" in request.files or params.get("image_path"):
-        import base64
-        # Safely validate the image without reading everything directly
-        raw, pil_image, _, err, code = _parse_image_upload(required=True, params=params)
-        if err:
-            return jsonify(err), code
-        fmt = (pil_image.format or "jpeg").lower()
-        b64 = base64.b64encode(raw).decode()
-        image_url = f"data:image/{fmt};base64,{b64}"
-
-    if not image_url:
-        return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
-
     try:
+        if not image_url or "file" in request.files or params.get("image_path"):
+            import base64
+            # Safely validate the image without reading everything directly
+            raw, pil_image, _, err, code = _parse_image_upload(required=True, params=params)
+            if err:
+                return jsonify(err), code
+            fmt = (pil_image.format or "jpeg").lower()
+            b64 = base64.b64encode(raw).decode()
+            image_url = f"data:image/{fmt};base64,{b64}"
+
+            # Explicitly free memory for large variables
+            del raw, pil_image, b64
+
+        if not image_url:
+            return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
+
         results = rotator.reverse_image_search(image_url, num_results)
         return jsonify({
             "status": "success",
@@ -618,6 +624,7 @@ def reverse_image_search():
             "usage": rotator.get_usage_status(),
         }), 200
     except Exception as exc:
+        logger.error("reverse_image_processing_failed", error=str(exc), exc_info=True)
         return jsonify({"error": str(exc), "code": "REVERSE_SEARCH_ERROR"}), 500
 
 

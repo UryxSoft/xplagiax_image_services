@@ -155,8 +155,8 @@ class TestCacheClient(unittest.TestCase):
     def _make_unavailable_cache(self):
         """Cache that simulates Redis being down."""
         from app.cache.redis_client import CacheClient
-        import redis
-        with patch("redis.Redis.ping", side_effect=redis.exceptions.RedisError("connection refused")):
+        from redis.exceptions import RedisError
+        with patch("redis.Redis.ping", side_effect=RedisError("connection refused")):
             with patch("app.cache.redis_client.get_metrics") as mock_metrics:
                 mock_metrics.return_value = MagicMock()
                 cache = CacheClient(

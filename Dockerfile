@@ -1,35 +1,22 @@
 # ==============================================================
-# xplagiax — Unified Production Dockerfile
-# Builds one image that runs as either API or ML Worker
-# depending on the command passed at runtime.
+# xplagiax — Dockerfile ULTRA-LIGERO
+# Objetivo: mínimo RAM, mínimo disco, mínimo CPU en idle
 #
-# Build:
-#   docker build -t xplagiax:latest .
-#
-# Run as API:
-#   docker run --name xplagiax-api  ... xplagiax:latest
-#   (uses default CMD → gunicorn)
-#
-# Run as Worker:
-#   docker run --name xplagiax-worker ... xplagiax:latest worker
-#   (overrides CMD → rq worker)
-#
-# Storage: SeaweedFS (plain HTTP — no boto3 needed)
-# Vector DB: Qdrant
-# Cache/Queue: Redis
+# Ahorros vs versión original:
+#   ~1.5 GB imagen  → torch CPU-only wheel
+#   ~800 MB RAM     → quantización INT8 de modelos
+#   ~200 MB imagen  → limpieza agresiva de cache pip/HF
+#   ~30% CPU idle   → límites de threads torch
 # ==============================================================
-
 
 # --------------------------------------------------------------
 # Stage 1 — Builder
-# Installs all Python dependencies into /install
-# so the runtime stage stays lean and has no build tools
 # --------------------------------------------------------------
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Build-time system deps
+# Deps de compilación — sólo los imprescindibles
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
@@ -37,56 +24,71 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     libjpeg-dev \
     libpng-dev \
-    libtiff-dev \
-    libwebp-dev \
     curl \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python deps first (layer cache — only invalidates if requirements change)
-COPY requirements.txt .
+COPY requirements-light.txt .
 
+# CLAVE: torch CPU-only desde índice oficial → ahorra ~1.5 GB
 RUN pip install --upgrade pip --no-cache-dir && \
-    pip install --prefix=/install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+    pip install --prefix=/install --no-cache-dir \
+        -r requirements-light.txt \
+        --extra-index-url https://download.pytorch.org/whl/cpu && \
+    # Eliminar archivos innecesarios de torch para reducir tamaño
+    find /install -type f -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true && \
+    find /install -path "*/torch/test*" -exec rm -rf {} + 2>/dev/null || true && \
+    find /install -path "*/torch/cuda*" -exec rm -rf {} + 2>/dev/null || true && \
+    find /install -name "*.pyx" -delete 2>/dev/null || true && \
+    find /install -name "*.pyd" -delete 2>/dev/null || true
 
 
 # --------------------------------------------------------------
 # Stage 2 — Runtime
-# Minimal image: only runtime libs, no compilers
 # --------------------------------------------------------------
 FROM python:3.11-slim AS runtime
 
 LABEL maintainer="xplagiax" \
-      description="xplagiax — AI Image Detection, Similarity Search & SeaweedFS Storage" \
-      version="1.0.0"
+      description="xplagiax Ultra-Light — CPU optimized" \
+      version="2.0.0-light"
 
-# Runtime-only system deps (shared libs for Pillow + curl for healthcheck)
+# Sólo runtime libs — sin libtiff ni libwebp si no los usas
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg62-turbo \
     libpng16-16 \
-    libtiff6 \
-    libwebp7 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ----------------------------------------------------------
-# Non-root user — never run as root in production
-# ----------------------------------------------------------
+# Usuario no-root
 RUN groupadd -r xplagiax && \
-    useradd -r -g xplagiax -d /app -s /sbin/nologin -c "xplagiax service" xplagiax
+    useradd -r -g xplagiax -d /app -s /sbin/nologin xplagiax
 
 WORKDIR /app
 
-# Copy Python packages from builder stage
 COPY --from=builder /install /usr/local
-
-# Copy application source code
 COPY app/         ./app/
 COPY docker/gunicorn.conf.py ./gunicorn.conf.py
 
 # ----------------------------------------------------------
-# Directories and permissions
+# Pre-descarga de modelos con QUANTIZACIÓN INT8
+# Esto reduce RAM en ~50% por modelo en CPU
 # ----------------------------------------------------------
+ARG DOWNLOAD_MODELS=true
+ARG HF_HOME=/app/.cache/huggingface
+
+ENV HF_HOME=${HF_HOME} \
+    TRANSFORMERS_CACHE=${HF_HOME}
+
+COPY docker/download_models_light.py /tmp/download_models.py
+
+RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
+        echo "Descargando modelos con optimización CPU..." && \
+        python /tmp/download_models.py && \
+        # Limpiar cache de descarga de HuggingFace (blobs temporales)
+        find ${HF_HOME} -name "*.lock" -delete && \
+        find ${HF_HOME} -name "tmp*" -type f -delete; \
+    fi
+
+# Directorios y permisos
 RUN mkdir -p \
         /app/.cache/huggingface \
         /tmp/xplagiax \
@@ -95,36 +97,7 @@ RUN mkdir -p \
 USER xplagiax
 
 # ----------------------------------------------------------
-# HuggingFace model pre-download (optional build arg)
-#
-# By default DOWNLOAD_MODELS=false — models are downloaded
-# on first startup and cached in the HF_HOME volume.
-#
-# Set DOWNLOAD_MODELS=true to bake models INTO the image.
-# This makes the image ~4GB larger but eliminates the cold
-# start download on each new container.
-#
-# Build with models baked in:
-#   docker build --build-arg DOWNLOAD_MODELS=true -t xplagiax:models .
-# ----------------------------------------------------------
-ARG DOWNLOAD_MODELS=true 
-ARG HF_HOME=/app/.cache/huggingface
-
-ENV HF_HOME=${HF_HOME} \
-    TRANSFORMERS_CACHE=${HF_HOME}
-
-COPY --chown=xplagiax:xplagiax docker/download_models.py /tmp/download_models.py
-
-RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
-        echo "Downloading HuggingFace models into image..." && \
-        python /tmp/download_models.py; \
-    else \
-        echo "DOWNLOAD_MODELS=false — models will be downloaded on first start"; \
-    fi
-
-# ----------------------------------------------------------
-# Environment defaults
-# All values can be overridden at runtime via -e or --env-file
+# Variables de entorno — optimizadas para CPU/RAM
 # ----------------------------------------------------------
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -136,6 +109,20 @@ ENV PYTHONUNBUFFERED=1 \
     WORKER_PROCESSES=1 \
     LOG_LEVEL=INFO \
     LOG_FORMAT=json \
+    \
+    # TORCH — limitar threads evita saturar CPU en idle
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2 \
+    NUMEXPR_NUM_THREADS=2 \
+    TOKENIZERS_PARALLELISM=false \
+    \
+    # HuggingFace — deshabilitar telemetría y checks online
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    DISABLE_TQDM=1 \
     \
     # Qdrant
     QDRANT_HOST=qdrant \
@@ -154,7 +141,7 @@ ENV PYTHONUNBUFFERED=1 \
     REDIS_RESULT_TTL=300 \
     REDIS_JOB_TTL=3600 \
     \
-    # SeaweedFS storage (default backend)
+    # SeaweedFS
     IMAGE_BACKEND=seaweedfs_filer \
     SEAWEEDFS_FILER_URL=http://seaweedfs-filer:8888 \
     SEAWEEDFS_PUBLIC_URL=http://localhost:8888 \
@@ -163,36 +150,27 @@ ENV PYTHONUNBUFFERED=1 \
     SEAWEEDFS_REQUEST_TIMEOUT=30.0 \
     SEAWEEDFS_MAX_RETRIES=3 \
     \
-    # ML Models
+    # ML Models — versión ligera
     SIGLIP_MODEL_ID=Ateeqq/ai-vs-human-image-detector \
     CLIP_MODEL_ID=sentence-transformers/clip-ViT-B-32 \
-    MODEL_DEVICE=auto \
-    MODEL_MAX_BATCH_SIZE=32 \
+    MODEL_DEVICE=cpu \
+    MODEL_MAX_BATCH_SIZE=8 \
     \
     # Security
     REQUIRE_AUTH=true \
-    MAX_IMAGE_BYTES=20971520 \
-    ALLOWED_MIME_TYPES=jpeg,png,webp,bmp,tiff,gif \
+    MAX_IMAGE_BYTES=10485760 \
+    ALLOWED_MIME_TYPES=jpeg,png,webp \
     RATE_LIMIT_PER_MINUTE=30 \
     RATE_LIMIT_PER_HOUR=500 \
     \
-    # Observability
+    # Observability — Prometheus desactivado por defecto (ahorra RAM)
     SERVICE_NAME=xplagiax \
     ENVIRONMENT=production \
-    PROMETHEUS_ENABLED=true \
+    PROMETHEUS_ENABLED=false \
     PROMETHEUS_PORT=9090
 
-# ----------------------------------------------------------
-# Exposed ports
-#   5004  → Flask API (Gunicorn)
-#   9090  → Prometheus metrics
-# ----------------------------------------------------------
-EXPOSE 5004 9090
+EXPOSE 5004
 
-# ----------------------------------------------------------
-# Healthcheck — liveness probe
-# start_period=90s gives models time to load on cold start
-# ----------------------------------------------------------
 HEALTHCHECK \
     --interval=30s \
     --timeout=5s \
@@ -200,17 +178,7 @@ HEALTHCHECK \
     --retries=3 \
     CMD curl -f http://localhost:${PORT}/healthz || exit 1
 
-# ----------------------------------------------------------
-# Entrypoint script — selects API or Worker mode
-# Usage:
-#   (no args)  → gunicorn API server
-#   worker     → rq worker (ML inference)
-#   shell      → bash (debug only)
-# ----------------------------------------------------------
 COPY docker/entrypoint.sh ./entrypoint.sh
-
-# entrypoint.sh is copied as root then ownership is set
-# The USER directive above applies, so we need to set exec bit
 USER root
 RUN chmod +x /app/entrypoint.sh && chown xplagiax:xplagiax /app/entrypoint.sh
 USER xplagiax

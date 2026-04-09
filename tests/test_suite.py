@@ -155,7 +155,8 @@ class TestCacheClient(unittest.TestCase):
     def _make_unavailable_cache(self):
         """Cache that simulates Redis being down."""
         from app.cache.redis_client import CacheClient
-        with patch("redis.Redis.ping", side_effect=Exception("connection refused")):
+        from redis.exceptions import RedisError
+        with patch("redis.Redis.ping", side_effect=RedisError("connection refused")):
             with patch("app.cache.redis_client.get_metrics") as mock_metrics:
                 mock_metrics.return_value = MagicMock()
                 cache = CacheClient(
@@ -586,7 +587,7 @@ class TestLocalImageStorage(unittest.TestCase):
     def test_url_is_api_path(self):
         key = "grp1/ab/abcdef.jpg"
         url = self.storage.get_url(key)
-        self.assertTrue(url.startswith("/images/"))
+        self.assertTrue(url.startswith("/api/v1/images/"))
 
     def test_path_traversal_cannot_escape_base(self):
         """Saving with a content_hash cannot escape the storage directory."""

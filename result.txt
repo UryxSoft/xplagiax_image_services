@@ -60,3 +60,4 @@ docker run -d \
   -e MODEL_DEVICE=cpu \
   -e LOG_FORMAT=json \
   xplagiax_image_service:latest worker
+

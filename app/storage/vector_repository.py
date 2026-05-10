@@ -105,12 +105,17 @@ class VectorRepository:
         self._collection = collection
         self._hnsw_ef_search = hnsw_ef_search
 
-        self._client = QdrantClient(
-            host=host,
-            port=port,
-            api_key=api_key,
-            timeout=10.0,
-        )
+        if host == ":memory:":
+            self._client = QdrantClient(
+                location=":memory:",
+            )
+        else:
+            self._client = QdrantClient(
+                host=host,
+                port=port,
+                api_key=api_key,
+                timeout=10.0,
+            )
 
         self._ensure_collection(hnsw_m, hnsw_ef_construct, full_scan_threshold)
         self._ensure_payload_indexes()
@@ -184,21 +189,21 @@ class VectorRepository:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def deterministic_id(content_hash: str) -> str:
+    def deterministic_id(content_hash: str, group_id: str = "default") -> str:
         """
-        Generate a deterministic UUID from content hash.
-        Same image bytes always produce the same point ID → upsert is idempotent.
+        Generate a deterministic UUID from content hash and group_id.
+        Same image bytes in the same group always produce the same point ID.
         Qdrant point IDs must be valid UUIDs or unsigned integers.
         """
         # Use UUID5 (SHA-1 namespace-based) for determinism
-        return str(uuid.uuid5(uuid.NAMESPACE_OID, content_hash))
+        return str(uuid.uuid5(uuid.NAMESPACE_OID, f"{content_hash}:{group_id}"))
 
     def upsert(self, point: ImagePoint) -> str:
         """
         Insert or update a point. Returns the point ID.
-        Idempotent: same content_hash always maps to same ID.
+        Idempotent: same content_hash + group_id always maps to same ID.
         """
-        point_id = self.deterministic_id(point.content_hash)
+        point_id = self.deterministic_id(point.content_hash, point.group_id)
 
         payload = {
             "filename":        point.filename,
@@ -256,7 +261,7 @@ class VectorRepository:
         structs = []
         ids = []
         for p in points:
-            point_id = self.deterministic_id(p.content_hash)
+            point_id = self.deterministic_id(p.content_hash, p.group_id)
             ids.append(point_id)
             payload = {
                 "filename":        p.filename,

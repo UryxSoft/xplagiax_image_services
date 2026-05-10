@@ -50,6 +50,8 @@ class EmbeddingResult:
 class ClassificationResult:
     is_ai: bool
     is_human: bool
+    is_uncertain: bool
+    confidence_bucket: str  # HIGH, MEDIUM, LOW
     label: str
     confidence: float
     ai_score: float
@@ -132,8 +134,8 @@ class ModelRegistry:
 
             # Quantización dinámica INT8 en CPU
             if self._use_quantization:
-                self._clip[0].auto_model = torch.quantization.quantize_dynamic(
-                    self._clip[0].auto_model,
+                self._clip = torch.quantization.quantize_dynamic(
+                    self._clip,
                     {torch.nn.Linear},
                     dtype=torch.qint8,
                 )
@@ -280,21 +282,41 @@ class ModelRegistry:
 
             id2label = self._siglip.config.id2label
             for prob_row in probs:
-                scores = {id2label[j]: float(prob_row[j]) for j in range(len(prob_row))}
-                top_label = max(scores, key=scores.get)
-                top_confidence = scores[top_label]
-                is_ai = top_label.lower() in ("ai", "artificial", "generated", "fake")
-                ai_score = max(
-                    (v for k, v in scores.items()
-                     if k.lower() in ("ai", "artificial", "generated", "fake")),
-                    default=1.0 - top_confidence if not is_ai else top_confidence,
-                )
-                get_metrics().siglip_confidence.observe(top_confidence)
+                # Recalibrate scores by summing all AI-related probabilities
+                ai_related_labels = ("ai", "artificial", "generated", "fake")
+                ai_score = sum(v for k, v in scores.items() if k.lower() in ai_related_labels)
+                human_score = sum(v for k, v in scores.items() if k.lower() not in ai_related_labels)
+                
+                # Normalize just in case
+                total = ai_score + human_score
+                if total > 0:
+                    ai_score /= total
+                    human_score /= total
+
+                # Threshold enforcement configurable via ENV (default 0.85)
+                threshold_high = float(os.environ.get("AI_CONFIDENCE_HIGH", "0.85"))
+                threshold_med = float(os.environ.get("AI_CONFIDENCE_MED", "0.60"))
+                
+                is_ai = ai_score >= threshold_high
+                is_human = human_score >= threshold_high
+                is_uncertain = not is_ai and not is_human
+                
+                max_score = max(ai_score, human_score)
+                if max_score >= threshold_high:
+                    bucket = "HIGH"
+                elif max_score >= threshold_med:
+                    bucket = "MEDIUM"
+                else:
+                    bucket = "LOW"
+                
+                get_metrics().siglip_confidence.observe(max_score)
                 results.append(ClassificationResult(
-                    is_ai=is_ai, is_human=not is_ai,
-                    label=top_label, confidence=top_confidence,
+                    is_ai=is_ai, is_human=is_human, is_uncertain=is_uncertain,
+                    confidence_bucket=bucket,
+                    label="ai" if ai_score > human_score else "human", 
+                    confidence=max_score,
                     ai_score=round(ai_score, 6),
-                    human_score=round(1.0 - ai_score, 6),
+                    human_score=round(human_score, 6),
                     all_scores={k: round(v, 6) for k, v in scores.items()},
                     model_id=self._siglip_model_id,
                     duration_ms=elapsed_ms / len(batch),

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from PIL import Image
+import imagehash
 
 from app.observability.telemetry import get_logger, get_metrics
 
@@ -110,10 +111,25 @@ class SimilarityService:
         if cached is not None:
             get_metrics().cache_hits.labels(cache_type="embedding").inc()
             return cached
+            
+        # Optional: Perceptual hash for near-duplicate detection before ML
+        try:
+            phash = str(imagehash.phash(pil_image))
+            cached_by_phash = self._cache.get(f"embed:phash:{phash}")
+            if cached_by_phash is not None:
+                get_metrics().cache_hits.labels(cache_type="embedding_phash").inc()
+                return cached_by_phash
+        except Exception as e:
+            logger.warning(f"phash calculation failed: {e}")
+            phash = None
 
         get_metrics().cache_misses.labels(cache_type="embedding").inc()
         result = self._models.embed_single(pil_image)
         self._cache.set_embedding(image_bytes, result.vector)
+        
+        if phash:
+            self._cache.set(f"embed:phash:{phash}", result.vector, ttl=86400 * 30)
+            
         return result.vector
 
     # ------------------------------------------------------------------

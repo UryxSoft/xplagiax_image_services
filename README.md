@@ -413,6 +413,16 @@ curl -X POST http://localhost:5010/api/v1/search/ai-detection \
   -H "X-API-Key: your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{"image_url": "https://example.com/image.png"}'
+
+
+  curl -X POST http://localhost:5000/api/v1/search/plagiarism \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://i.pinimg.com/736x/3d/dd/21/3ddd21adb1de06e188d0edb67f13c207.jpg", "similarity_threshold": 0.90}'
+
+  curl -X POST http://localhost:5010/api/v1/search/ai-detection \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://i.pinimg.com/736x/3d/dd/21/3ddd21adb1de06e188d0edb67f13c207.jpg"}'
+
 ```
 
 ### Reverse Image Search (via JSON URL)

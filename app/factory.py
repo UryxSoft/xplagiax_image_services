@@ -81,7 +81,9 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
     # ------------------------------------------------------------------ #
     metrics = init_metrics(config.observability.service_name)
     if config.observability.prometheus_enabled:
-        metrics.start_prometheus_server(config.observability.prometheus_port)
+        # Prevent Address already in use error when Flask reloader spawns child process
+        if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+            metrics.start_prometheus_server(config.observability.prometheus_port)
 
     # ------------------------------------------------------------------ #
     # 4. Redis cache                                                      #

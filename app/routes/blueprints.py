@@ -522,19 +522,23 @@ def patent_search_by_image():
     # Allow local paths and files to fallback to base64 usage.
     # If image_url is a local path or external URL we shouldn't base64 it necessarily unless it's a file
     # _parse_image_upload will handle path retrieval seamlessly.
+    storage_key = None
     try:
         if not image_url or "file" in request.files or params.get("image_path"):
-            import base64
-            # Safely validate the image without reading everything directly
-            raw, pil_image, _, err, code = _parse_image_upload(required=True, params=params)
+            raw, pil_image, filename, err, code = _parse_image_upload(required=True, params=params)
             if err:
                 return jsonify(err), code
+            
+            storage = _svc("storage")
+            import hashlib
+            content_hash = hashlib.sha256(raw).hexdigest()
             fmt = (pil_image.format or "jpeg").lower()
-            b64 = base64.b64encode(raw).decode()
-            image_url = f"data:image/{fmt};base64,{b64}"
+            
+            storage_key = storage.save(raw, content_hash, "temp_search", filename, fmt)
+            image_url = storage.get_url(storage_key, expiry_seconds=3600)
 
             # Explicitly free memory for large variables
-            del raw, pil_image, b64
+            del raw, pil_image
 
         if not image_url:
             return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
@@ -548,6 +552,14 @@ def patent_search_by_image():
     except Exception as exc:
         logger.error("patent_image_search_failed", error=str(exc), exc_info=True)
         return jsonify({"error": str(exc), "code": "PATENT_SEARCH_ERROR"}), 500
+    finally:
+        if storage_key:
+            try:
+                storage = _svc("storage")
+                if storage:
+                    storage.delete(storage_key)
+            except Exception as e:
+                logger.warning("cleanup_failed", key=storage_key, error=str(e))
 
 
 @patents_bp.route("/search/text", methods=["POST"])
@@ -600,19 +612,23 @@ def reverse_image_search():
     image_url = params.get("image_url")
     num_results = min(int(params.get("num_results", 10)), 50)
 
+    storage_key = None
     try:
         if not image_url or "file" in request.files or params.get("image_path"):
-            import base64
-            # Safely validate the image without reading everything directly
-            raw, pil_image, _, err, code = _parse_image_upload(required=True, params=params)
+            raw, pil_image, filename, err, code = _parse_image_upload(required=True, params=params)
             if err:
                 return jsonify(err), code
+            
+            storage = _svc("storage")
+            import hashlib
+            content_hash = hashlib.sha256(raw).hexdigest()
             fmt = (pil_image.format or "jpeg").lower()
-            b64 = base64.b64encode(raw).decode()
-            image_url = f"data:image/{fmt};base64,{b64}"
+            
+            storage_key = storage.save(raw, content_hash, "temp_search", filename, fmt)
+            image_url = storage.get_url(storage_key, expiry_seconds=3600)
 
             # Explicitly free memory for large variables
-            del raw, pil_image, b64
+            del raw, pil_image
 
         if not image_url:
             return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
@@ -626,6 +642,14 @@ def reverse_image_search():
     except Exception as exc:
         logger.error("reverse_image_processing_failed", error=str(exc), exc_info=True)
         return jsonify({"error": str(exc), "code": "REVERSE_SEARCH_ERROR"}), 500
+    finally:
+        if storage_key:
+            try:
+                storage = _svc("storage")
+                if storage:
+                    storage.delete(storage_key)
+            except Exception as e:
+                logger.warning("cleanup_failed", key=storage_key, error=str(e))
 
 
 @patents_bp.route("/usage", methods=["GET"])

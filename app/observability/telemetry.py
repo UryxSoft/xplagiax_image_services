@@ -24,6 +24,17 @@ from prometheus_client import (
     REGISTRY,
 )
 
+# Optional OTLP
+try:
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    OTLP_AVAILABLE = True
+except ImportError:
+    OTLP_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
@@ -71,6 +82,20 @@ def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None
 
 def get_logger(name: str) -> structlog.BoundLogger:
     return structlog.get_logger(name)
+
+
+def init_tracing(service_name: str, endpoint: str = "http://localhost:4317"):
+    """Initialize OpenTelemetry tracing if available."""
+    if not OTLP_AVAILABLE:
+        get_logger(__name__).warning("OpenTelemetry not installed. Tracing disabled.")
+        return
+
+    resource = Resource.create({"service.name": service_name})
+    provider = TracerProvider(resource=resource)
+    processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
+    provider.add_span_processor(processor)
+    trace.set_tracer_provider(provider)
+    get_logger(__name__).info("otlp_tracing_initialized", endpoint=endpoint)
 
 
 # ---------------------------------------------------------------------------

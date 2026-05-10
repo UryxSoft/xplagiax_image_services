@@ -8,10 +8,10 @@ PORT = int(os.getenv("PORT", "5004"))
 bind = f"0.0.0.0:{PORT}"
 backlog = 512                    # reducido de 2048 — menos conexiones en cola
 
-# UN solo worker — los modelos ML (~1 GB) no se duplican
-workers = 1
+# API is purely async I/O now. ML inferencing is decoupled to RQ workers.
+workers = 2
 worker_class = "gevent"
-worker_connections = 200         # reducido de 1000
+worker_connections = 1000
 
 # Timeouts
 timeout = 120
@@ -45,8 +45,3 @@ def post_fork(server, worker):
     import random, numpy as np
     random.seed()
     np.random.seed()
-    # Limitar threads por worker
-    import torch
-    n = int(os.getenv("OMP_NUM_THREADS", "2"))
-    torch.set_num_threads(n)
-    torch.set_num_interop_threads(n)

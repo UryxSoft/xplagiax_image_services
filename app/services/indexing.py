@@ -130,7 +130,7 @@ class IndexingService:
         job_id = str(uuid.uuid4())
 
         # Check if this exact image is already indexed (idempotency)
-        expected_point_id = self._repo.deterministic_id(content_hash)
+        expected_point_id = self._repo.deterministic_id(content_hash, group_id)
         existing = self._repo.get_by_id(expected_point_id)
         if existing:
             logger.info(

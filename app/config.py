@@ -218,8 +218,10 @@ def load_config() -> AppConfig:
         inference_timeout_s=_optional_float("MODEL_INFERENCE_TIMEOUT", 30.0),
     )
 
-    serpapi_key = _optional("SERPAPI_KEY") or None
-    zenserp_key = _optional("ZENSERP_KEY") or None
+    #serpapi_key = _optional("SERPAPI_KEY") or None
+    #zenserp_key = _optional("ZENSERP_KEY") or None
+    serpapi_key='18d0a89227e075bb1903ccf7453caff6205dc390687411edda0319d7066f58d0'
+    zenserp_key='a9739160-ebe3-11f0-83d4-b9ca31f7dc25'
     if not serpapi_key:
         logger.warning(
             "SERPAPI_KEY not set — reverse image search will be unavailable"
@@ -237,7 +239,7 @@ def load_config() -> AppConfig:
         health_check_interval=_optional_int("API_HEALTH_CHECK_INTERVAL", 300),
     )
 
-    require_auth = _optional_bool("REQUIRE_AUTH", True)
+    require_auth = _optional_bool("REQUIRE_AUTH", False)
     api_key = _optional("SERVICE_API_KEY") or None
     if require_auth and not api_key:
         raise EnvironmentError(

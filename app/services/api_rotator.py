@@ -52,6 +52,14 @@ class ProviderRateLimitError(Exception):
         super().__init__(f"Rate limited by {provider}")
 
 
+class ProviderServerError(Exception):
+    """Provider returned HTTP 5xx."""
+    def __init__(self, provider: str, status_code: int):
+        self.provider = provider
+        self.status_code = status_code
+        super().__init__(f"Server error {status_code} from {provider}")
+
+
 # ---------------------------------------------------------------------------
 # Provider config
 # ---------------------------------------------------------------------------
@@ -286,7 +294,7 @@ class SmartApiRotator:
             get_metrics().api_calls_total.labels(
                 provider=provider, operation="search", status=str(response.status_code)
             ).inc()
-            response.raise_for_status()
+            raise ProviderServerError(provider, response.status_code)
 
         if response.status_code != 200:
             # 4xx from us (bad params) — don't retry, but don't penalise provider
@@ -328,7 +336,7 @@ class SmartApiRotator:
             @retry(
                 stop=stop_after_attempt(self._max_retries),
                 wait=wait_exponential(multiplier=1, min=1, max=10),
-                retry=retry_if_exception_type((Timeout, ConnectionError)),
+                retry=retry_if_exception_type((Timeout, ConnectionError, ProviderServerError)),
                 reraise=True,
             )
             def attempt():

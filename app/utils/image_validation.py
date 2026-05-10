@@ -18,6 +18,8 @@ from typing import Optional, Tuple
 
 from PIL import Image, UnidentifiedImageError
 
+Image.MAX_IMAGE_PIXELS = 100_000_000  # Protection against Decompression Bombs
+
 from app.observability.telemetry import get_logger
 
 logger = get_logger(__name__)

@@ -7,10 +7,11 @@ Secure and robust image fetching from multiple sources:
 
 import os
 import requests
-from urllib.parse import urlparse
+import urllib.parse
 from typing import Tuple, Optional
 from werkzeug.datastructures import FileStorage
 
+from app.security.http_client import safe_download, SSRFViolationError, DownloadLimitExceededError
 from app.utils.image_validation import ImageValidationError
 
 def fetch_image_bytes(
@@ -37,29 +38,20 @@ def fetch_image_bytes(
         return image_bytes, file_upload.filename
 
     if image_url:
-        parsed = urlparse(image_url)
-        if parsed.scheme not in ("http", "https"):
-            raise ImageValidationError("Invalid URL scheme. Only HTTP/HTTPS allowed.")
-
         try:
-            with requests.get(image_url, stream=True, timeout=5.0) as resp:
-                resp.raise_for_status()
-
-                # Check Content-Length header if available
-                cl = resp.headers.get("Content-Length")
-                if cl and int(cl) > max_bytes:
-                    raise ImageValidationError(f"Remote image too large (Content-Length: {cl} bytes).")
-
-                downloaded_bytes = bytearray()
-                for chunk in resp.iter_content(chunk_size=8192):
-                    downloaded_bytes.extend(chunk)
-                    if len(downloaded_bytes) > max_bytes:
-                        raise ImageValidationError(f"Remote image too large (exceeds {max_bytes} bytes limit).")
-
-                filename = os.path.basename(parsed.path) or "remote_image.jpg"
-                return bytes(downloaded_bytes), filename
-        except requests.RequestException as e:
-            raise ImageValidationError(f"Failed to fetch remote image: {str(e)}")
+            # safe_download handles SSRF, Redirects, and DOS streaming automatically
+            raw_bytes, content_type = safe_download(
+                image_url, 
+                max_bytes=max_bytes, 
+                timeout=5.0
+            )
+            parsed = urllib.parse.urlparse(image_url)
+            filename = os.path.basename(parsed.path) or "remote_image.jpg"
+            return raw_bytes, filename
+        except (SSRFViolationError, DownloadLimitExceededError) as e:
+            raise ImageValidationError(str(e))
+        except Exception as e:
+            raise ImageValidationError(f"Failed to download image: {str(e)}")
 
     if image_path:
         if not os.path.isabs(image_path):

@@ -30,11 +30,11 @@ clip = SentenceTransformer("sentence-transformers/clip-ViT-B-32", device="cpu")
 
 # Quantización dinámica INT8 — reduce RAM ~40% en CPU
 clip_quantized = torch.quantization.quantize_dynamic(
-    clip[0].auto_model,           # el modelo interno de transformers
+    clip,                         # el modelo entero de sentence-transformers
     {torch.nn.Linear},            # sólo capas Linear (las más pesadas)
     dtype=torch.qint8
 )
-clip[0].auto_model = clip_quantized
+clip = clip_quantized
 
 # Warm-up
 dummy_img = Image.new("RGB", (224, 224), color=(128, 128, 128))

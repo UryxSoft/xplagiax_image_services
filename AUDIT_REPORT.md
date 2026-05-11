@@ -7,7 +7,43 @@ Como arquitecto de software senior, he realizado una auditoría exhaustiva del p
 No obstante, la auditoría ha identificado varios problemas de seguridad, condiciones de carrera críticas y deficiencias funcionales que comprometen la resiliencia y el comportamiento del sistema en un entorno de producción, los cuales se describen a continuación junto con sus soluciones.
 
 ---
+curl -X POST http://localhost:5010/api/v1/search/ai-detection \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://i.pinimg.com/736x/3d/dd/21/3ddd21adb1de06e188d0edb67f13c207.jpg"}'
 
+```
+[ignoring loop detection]
+
+¡Claro! Antes de hacer el docker build nuevamente, es una excelente idea limpiar los contenedores viejos que fallaron.
+
+Ejecuta estos comandos en el terminal de tu VPS en este orden exacto:
+
+1. Detener los contenedores si están corriendo:
+bash
+docker stop xplagiax_image_service xplagiax-worker
+(Es normal que te salga un error si alguno ya estaba apagado o no existía, ignóralo).
+
+2. Borrar los contenedores:
+bash
+docker rm xplagiax_image_service xplagiax-worker
+3. Borrar la imagen antigua para liberar espacio:
+bash
+docker rmi xplagiax_image_service:latest
+4. Opcional (Limpieza profunda):
+Si quieres limpiar todas las "capas" de instalaciones fallidas y basurilla residual de Docker para recuperar espacio extra en el disco del VPS, corre este comando (presiona y cuando te pregunte):
+
+bash
+docker builder prune -a -f
+¡Listo! Tu servidor está completamente limpio. Ahora sí, puedes ejecutar la secuencia para actualizar y volver a armar tu microservicio:
+
+bash
+git pull origin main
+docker build -t xplagiax_image_service:latest .
+9:37 PM
+
+```
+
+  
 ## 2. Bugs Funcionales y Lógicos
 
 ### 2.1 Pérdida de Seguridad al Bypasear Límite de Tamaño de Petición

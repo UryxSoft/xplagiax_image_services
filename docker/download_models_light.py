@@ -57,7 +57,7 @@ siglip = SiglipForImageClassification.from_pretrained(
     # Cargar en bfloat16 si está disponible — usa ~50% menos RAM que float32
     # En CPU puro usamos float32 para compatibilidad
     torch_dtype=torch.float32,
-    low_cpu_mem_usage=True,       # carga el modelo de forma eficiente en memoria
+    low_cpu_mem_usage=False,      # desactivado porque requiere 'accelerate'
 )
 siglip.eval()
 

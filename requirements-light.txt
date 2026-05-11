@@ -22,6 +22,7 @@ transformers==4.42.4
 sentence-transformers==3.0.1
 Pillow==10.4.0
 numpy==1.26.4
+imagehash==4.3.1
 
 # Quantización INT8 para CPU (incluida en torch, pero optimum la expone mejor)
 optimum==1.21.2

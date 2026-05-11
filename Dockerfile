@@ -36,7 +36,6 @@ RUN pip install --upgrade pip --no-cache-dir && \
         --extra-index-url https://download.pytorch.org/whl/cpu && \
     # Eliminar archivos innecesarios de torch para reducir tamaño
     find /install -type f -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true && \
-    find /install -path "*/torch/test*" -exec rm -rf {} + 2>/dev/null || true && \
     find /install -name "*.pyx" -delete 2>/dev/null || true && \
     find /install -name "*.pyd" -delete 2>/dev/null || true
 

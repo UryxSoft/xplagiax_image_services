@@ -156,7 +156,7 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
                 models.load_all()
                 logger.info("models_ready_serving_traffic")
             except Exception as e:
-                logger.error("background_model_loader_failed", error=str(e))
+                logger.error("background_model_loader_failed", error=str(e), exc_info=True)
 
     t = threading.Thread(target=_load_models_background, daemon=True, name="model-loader")
     t.start()

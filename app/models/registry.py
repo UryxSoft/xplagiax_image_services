@@ -176,7 +176,7 @@ class ModelRegistry:
             self._siglip = SiglipForImageClassification.from_pretrained(
                 self._siglip_model_id,
                 torch_dtype=torch.float32,
-                low_cpu_mem_usage=True,   # carga eficiente — no duplica en RAM
+                low_cpu_mem_usage=False,   # carga eficiente — no duplica en RAM
             )
             self._siglip.to(self._device)
             self._siglip.eval()
@@ -282,6 +282,7 @@ class ModelRegistry:
 
             id2label = self._siglip.config.id2label
             for prob_row in probs:
+                scores = {id2label[i]: float(p) for i, p in enumerate(prob_row)}
                 # Recalibrate scores by summing all AI-related probabilities
                 ai_related_labels = ("ai", "artificial", "generated", "fake")
                 ai_score = sum(v for k, v in scores.items() if k.lower() in ai_related_labels)

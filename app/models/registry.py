@@ -151,7 +151,7 @@ class ModelRegistry:
                 device=str(self._device), load_time_s=round(elapsed, 2),
                 quantized=self._use_quantization,
             )
-            get_metrics().model_loaded.labels(model_name="clip").set(1)
+            get_metrics().model_loaded.labels(model="clip").set(1)
             logger.info("clip_loaded", elapsed_s=round(elapsed, 2),
                         quantized=self._use_quantization)
         except Exception as exc:
@@ -159,7 +159,7 @@ class ModelRegistry:
                 name=self._clip_model_id, loaded=False,
                 device=str(self._device), error=str(exc),
             )
-            get_metrics().model_loaded.labels(model_name="clip").set(0)
+            get_metrics().model_loaded.labels(model="clip").set(0)
             logger.error("clip_load_failed", error=str(exc), exc_info=True)
 
     def _load_siglip(self) -> None:
@@ -206,7 +206,7 @@ class ModelRegistry:
                 device=str(self._device), load_time_s=round(elapsed, 2),
                 quantized=self._use_quantization,
             )
-            get_metrics().model_loaded.labels(model_name="siglip").set(1)
+            get_metrics().model_loaded.labels(model="siglip").set(1)
             logger.info("siglip_loaded", elapsed_s=round(elapsed, 2),
                         quantized=self._use_quantization)
         except Exception as exc:
@@ -214,7 +214,7 @@ class ModelRegistry:
                 name=self._siglip_model_id, loaded=False,
                 device=str(self._device), error=str(exc),
             )
-            get_metrics().model_loaded.labels(model_name="siglip").set(0)
+            get_metrics().model_loaded.labels(model="siglip").set(0)
             logger.error("siglip_load_failed", error=str(exc), exc_info=True)
 
     # ------------------------------------------------------------------

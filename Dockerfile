@@ -116,8 +116,8 @@ ENV PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=false \
     \
     # HuggingFace — deshabilitar telemetría y checks online
-    TRANSFORMERS_OFFLINE=1 \
-    HF_HUB_OFFLINE=1 \
+    #TRANSFORMERS_OFFLINE=1 \
+    #HF_HUB_OFFLINE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     HF_HUB_DISABLE_PROGRESS_BARS=1 \
     DISABLE_TQDM=1 \

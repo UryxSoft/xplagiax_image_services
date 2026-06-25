@@ -369,6 +369,34 @@ class ModelRegistry:
     def classify_single(self, image: Image.Image) -> ClassificationResult:
         return self.classify_ai_human([image])[0]
 
+    def _safe_classify_single(self, image: Image.Image) -> Optional[ClassificationResult]:
+        try:
+            return self.classify_single(image)
+        except Exception as exc:
+            logger.warning("siglip_failed_degraded", error=str(exc))
+            return None
+
+    def embed_and_classify(
+        self, image: Image.Image, run_ai_detection: bool = True
+    ) -> tuple[EmbeddingResult, Optional[ClassificationResult]]:
+        """
+        Run CLIP embedding and (optionally) SigLIP classification CONCURRENTLY.
+
+        CLIP and SigLIP are independent; torch releases the GIL during native
+        compute, so two OS threads overlap on CPU → wall-clock ≈ max(t_clip,
+        t_siglip) instead of the sum. Bounded by INFERENCE_MAX_CONCURRENCY.
+        SigLIP failures degrade gracefully (returns None). No behaviour change
+        vs the sequential path other than latency.
+        """
+        if not (run_ai_detection and self.siglip_ready):
+            return self.embed_single(image), None
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_embed = ex.submit(self.embed_single, image)
+            f_cls = ex.submit(self._safe_classify_single, image)
+            return f_embed.result(), f_cls.result()
+
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------

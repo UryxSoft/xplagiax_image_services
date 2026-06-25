@@ -109,12 +109,16 @@ def validate_and_load(
             f"Accepted: {', '.join(sorted(allowed_mimes))}"
         )
 
-    # --- 4. Header inspection BEFORE decoding (anti decompression bomb) ---
+    # --- 4. Header inspection + integrity in ONE open (anti decompression bomb) ---
+    # Read size/frames (header only, no pixel decode) and verify() on the same
+    # handle, then run the cheap checks BEFORE the expensive decode. This is 2
+    # opens total (probe + decode) instead of 3, with identical guarantees.
     try:
-        with Image.open(io.BytesIO(file_bytes)) as header:
-            w, h = header.size
-            n_frames = getattr(header, "n_frames", 1)
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        with Image.open(io.BytesIO(file_bytes)) as probe:
+            w, h = probe.size
+            n_frames = getattr(probe, "n_frames", 1)
+            probe.verify()  # truncation / corruption
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
         raise ImageValidationError(f"Corrupt or unreadable image: {exc}") from exc
 
     if w < _MIN_DIMENSION or h < _MIN_DIMENSION:
@@ -131,13 +135,7 @@ def validate_and_load(
             f"Animated / multi-page images are not allowed ({n_frames} frames)."
         )
 
-    # --- 5. Integrity verify() + decode ---
-    try:
-        with Image.open(io.BytesIO(file_bytes)) as check:
-            check.verify()  # truncation / corruption
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
-        raise ImageValidationError(f"Corrupt or unreadable image: {exc}") from exc
-
+    # --- 5. Decode to RGB ---
     try:
         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:

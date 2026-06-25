@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError, HTTPError, Timeout
 from tenacity import (
     retry,
@@ -299,12 +300,19 @@ class SmartApiRotator:
         redis_client=None,
         circuit_failure_threshold: int = 5,
         circuit_recovery_s: int = 120,
+        cache=None,
     ) -> None:
         self._providers = {p.name: p for p in providers}
         self._usage = usage_tracker
         self._timeout = request_timeout_s
         self._max_retries = max_retries
         self._reverse_engine = reverse_engine
+        self._cache = cache   # CacheClient (optional) for reverse-result caching
+        # Pooled HTTPS session → reuse TCP/TLS across external calls (no per-call handshake)
+        self._session = requests.Session()
+        _adapter = HTTPAdapter(pool_connections=10, pool_maxsize=50, max_retries=0)
+        self._session.mount("https://", _adapter)
+        self._session.mount("http://", _adapter)
         self._scores: dict[str, ProviderScore] = {
             p.name: ProviderScore(name=p.name) for p in providers
         }
@@ -367,7 +375,7 @@ class SmartApiRotator:
         """Make a single HTTP request, recording score and usage."""
         start = time.perf_counter()
         try:
-            response = requests.get(url, params=params, timeout=self._timeout)
+            response = self._session.get(url, params=params, timeout=self._timeout)
         except (Timeout, ConnectionError) as exc:
             elapsed_ms = (time.perf_counter() - start) * 1000
             self._scores[provider].record(success=False, response_ms=elapsed_ms)
@@ -430,10 +438,11 @@ class SmartApiRotator:
         ordered = self._available_providers()
         last_exc: Optional[Exception] = None
 
-        # Retry policy defined ONCE (not rebuilt per iteration).
+        # Retry policy defined ONCE (not rebuilt per iteration). Capped backoff
+        # (max=5s) so we fail over to the next provider quickly → lower p99.
         retry_policy = retry(
             stop=stop_after_attempt(self._max_retries),
-            wait=wait_exponential(multiplier=1, min=1, max=10),
+            wait=wait_exponential(multiplier=1, min=1, max=5),
             retry=retry_if_exception_type((Timeout, ConnectionError, ProviderServerError)),
             reraise=True,
         )
@@ -468,15 +477,31 @@ class SmartApiRotator:
     # Public API
     # ------------------------------------------------------------------
 
-    def reverse_image_search(self, image_url: str, num_results: int = 10) -> dict:
+    def reverse_image_search(
+        self, image_url: str, num_results: int = 10, cache_key: Optional[str] = None
+    ) -> dict:
         """
         Determine whether an image appears elsewhere on the internet.
 
         Uses Google Lens (best available reverse-image method) via SerpApi by
         default; falls back to google_reverse_image or Zenserp. Returns a
         NORMALISED, provider-agnostic result with an explicit verdict.
+
+        If `cache_key` (e.g. the image content hash) is given and Redis is up,
+        a previously found result is served from cache — skipping the 1-3 s
+        provider round-trip AND the paid quota. RECALL-SAFE: only positive
+        ("found online") results are cached; not-found is always re-queried.
         """
         engine = self._reverse_engine
+
+        ck = None
+        if cache_key and self._cache and self._cache.available:
+            ck = f"{engine}:{cache_key}:{num_results}"
+            hit = self._cache.get_reverse(ck)
+            if hit is not None:
+                out = dict(hit)
+                out["cached"] = True
+                return out
 
         def build(provider: str) -> tuple[str, dict]:
             if provider == "serpapi":
@@ -499,7 +524,13 @@ class SmartApiRotator:
             raise ValueError(f"Unknown provider: {provider}")
 
         provider, raw = self._execute_with_fallback(build)
-        return normalize_reverse_results(provider, engine, raw, image_url, num_results)
+        result = normalize_reverse_results(provider, engine, raw, image_url, num_results)
+        result["cached"] = False
+        # Cache positive results only (recall-safe). The web changes slowly, so
+        # a found image stays found within the TTL window.
+        if ck is not None and result.get("found_on_internet"):
+            self._cache.set_reverse(ck, {k: v for k, v in result.items() if k != "cached"})
+        return result
 
     def patent_text_search(self, query: str, num_results: int = 10) -> dict:
         def build(provider: str) -> tuple[str, dict]:
@@ -528,12 +559,14 @@ class SmartApiRotator:
         _provider, raw = self._execute_with_fallback(build)
         return raw
 
-    def patent_image_search(self, image_url: str, num_results: int = 10) -> dict:
+    def patent_image_search(
+        self, image_url: str, num_results: int = 10, cache_key: Optional[str] = None
+    ) -> dict:
         """
         Two-step: reverse image → extract keywords → patent search.
-        Counts as 2 API calls.
+        Counts as 2 API calls (the reverse step may be served from cache).
         """
-        reverse = self.reverse_image_search(image_url, num_results=3)
+        reverse = self.reverse_image_search(image_url, num_results=3, cache_key=cache_key)
         keywords = " ".join(
             m.get("title", "") for m in (reverse.get("matches") or [])[:3]
         ).strip()
@@ -601,10 +634,10 @@ class SmartApiRotator:
             try:
                 # SerpApi has a public status endpoint
                 if name == "serpapi":
-                    resp = requests.head("https://serpapi.com/", timeout=5)
+                    resp = self._session.head("https://serpapi.com/", timeout=5)
                     ok = resp.status_code < 500
                 elif name == "zenserp":
-                    resp = requests.head("https://app.zenserp.com/", timeout=5)
+                    resp = self._session.head("https://app.zenserp.com/", timeout=5)
                     ok = resp.status_code < 500
                 else:
                     ok = True

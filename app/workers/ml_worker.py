@@ -73,6 +73,8 @@ def _init_worker():
         embedding_ttl=cfg.redis.embedding_ttl,
         result_ttl=cfg.redis.result_ttl,
         job_ttl=cfg.redis.job_ttl,
+        reverse_ttl=cfg.redis.reverse_ttl,
+        ai_ttl=cfg.redis.ai_ttl,
     )
 
     _storage = create_storage(
@@ -163,27 +165,22 @@ def process_index_job(
         image_bytes = _storage.load(storage_key)
         pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-        # CLIP embedding
-        embed_result = _models.embed_single(pil_image)
+        # CLIP embedding ∥ SigLIP detection (concurrent), then cache embedding
+        embed_result, cls = _models.embed_and_classify(
+            pil_image, run_ai_detection=run_ai_detection
+        )
+        _cache.set_embedding(digest=content_hash, vector=embed_result.vector)
 
-        # Cache embedding for future requests
-        _cache.set_embedding(image_bytes, embed_result.vector)
-
-        # AI detection (optional, degraded gracefully)
         ai_result = None
-        if run_ai_detection and _models.siglip_ready:
-            try:
-                cls = _models.classify_single(pil_image)
-                ai_result = {
-                    "is_ai":       cls.is_ai,
-                    "is_human":    cls.is_human,
-                    "label":       cls.label,
-                    "confidence":  cls.confidence,
-                    "ai_score":    cls.ai_score,
-                    "human_score": cls.human_score,
-                }
-            except Exception as exc:
-                logger.warning("worker_siglip_failed", job_id=job_id, error=str(exc))
+        if cls is not None:
+            ai_result = {
+                "is_ai":       cls.is_ai,
+                "is_human":    cls.is_human,
+                "label":       cls.label,
+                "confidence":  cls.confidence,
+                "ai_score":    cls.ai_score,
+                "human_score": cls.human_score,
+            }
 
         # Build and upsert point
         from app.storage.vector_repository import ImagePoint

@@ -102,17 +102,28 @@ class SimilarityService:
     # Embedding with cache
     # ------------------------------------------------------------------
 
-    def get_embedding(self, image_bytes: bytes, pil_image: Image.Image) -> list[float]:
+    def get_embedding(
+        self,
+        image_bytes: bytes,
+        pil_image: Image.Image,
+        content_hash: Optional[str] = None,
+    ) -> list[float]:
         """
         Get CLIP embedding for image bytes.
         Checks cache first; computes and caches on miss.
+
+        `content_hash` lets callers reuse an already-computed SHA-256 so the
+        bytes are hashed only ONCE per request (cache.get_embedding handles
+        the embedding hit/miss metrics).
         """
-        cached = self._cache.get_embedding(image_bytes)
+        digest = content_hash or hashlib.sha256(image_bytes).hexdigest()
+
+        cached = self._cache.get_embedding(digest=digest)
         if cached is not None:
-            get_metrics().cache_hits.labels(cache_type="embedding").inc()
             return cached
-            
-        # Optional: Perceptual hash for near-duplicate detection before ML
+
+        # Secondary near-duplicate cache via perceptual hash.
+        phash = None
         try:
             phash = str(imagehash.phash(pil_image))
             cached_by_phash = self._cache.get(f"embed:phash:{phash}")
@@ -121,15 +132,12 @@ class SimilarityService:
                 return cached_by_phash
         except Exception as e:
             logger.warning(f"phash calculation failed: {e}")
-            phash = None
 
-        get_metrics().cache_misses.labels(cache_type="embedding").inc()
         result = self._models.embed_single(pil_image)
-        self._cache.set_embedding(image_bytes, result.vector)
-        
+        self._cache.set_embedding(digest=digest, vector=result.vector)
         if phash:
             self._cache.set(f"embed:phash:{phash}", result.vector, ttl=86400 * 30)
-            
+
         return result.vector
 
     # ------------------------------------------------------------------
@@ -171,7 +179,8 @@ class SimilarityService:
         start = time.perf_counter()
         content_hash = hashlib.sha256(image_bytes).hexdigest()
 
-        vector = self.get_embedding(image_bytes, pil_image)
+        # Reuse the hash we just computed — do not re-hash inside get_embedding.
+        vector = self.get_embedding(image_bytes, pil_image, content_hash=content_hash)
 
         exclude_hash = content_hash if exclude_self else None
 

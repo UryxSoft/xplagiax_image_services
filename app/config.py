@@ -97,6 +97,8 @@ class RedisConfig:
     embedding_ttl: int       # 24h — embeddings rarely change for same image bytes
     result_ttl: int          # 5 min — search results can change as collection grows
     job_ttl: int             # 1h — async job results
+    reverse_ttl: int = 7 * 86_400    # 7d — reverse-search results (web changes slowly)
+    ai_ttl: int = 30 * 86_400        # 30d — AI detection (deterministic for same bytes)
 
 
 @dataclass(frozen=True)
@@ -229,6 +231,8 @@ def load_config() -> AppConfig:
         embedding_ttl=_optional_int("REDIS_EMBEDDING_TTL", 86_400),
         result_ttl=_optional_int("REDIS_RESULT_TTL", 300),
         job_ttl=_optional_int("REDIS_JOB_TTL", 3_600),
+        reverse_ttl=_optional_int("REDIS_REVERSE_TTL", 7 * 86_400),
+        ai_ttl=_optional_int("REDIS_AI_TTL", 30 * 86_400),
     )
 
     device = _optional("MODEL_DEVICE", "auto")
@@ -273,7 +277,7 @@ def load_config() -> AppConfig:
         zenserp_key=zenserp_key,
         usage_backend=_optional("API_USAGE_BACKEND", "redis"),
         usage_file=_optional("API_USAGE_FILE", "/tmp/api_usage.json"),
-        request_timeout_s=_optional_float("API_REQUEST_TIMEOUT", 15.0),
+        request_timeout_s=_optional_float("API_REQUEST_TIMEOUT", 10.0),
         max_retries=_optional_int("API_MAX_RETRIES", 3),
         serpapi_limit=_optional_int("SERPAPI_MONTHLY_LIMIT", 250),
         zenserp_limit=_optional_int("ZENSERP_MONTHLY_LIMIT", 50),

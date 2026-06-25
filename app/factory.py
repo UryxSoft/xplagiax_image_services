@@ -106,6 +106,8 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
         embedding_ttl=config.redis.embedding_ttl,
         result_ttl=config.redis.result_ttl,
         job_ttl=config.redis.job_ttl,
+        reverse_ttl=config.redis.reverse_ttl,
+        ai_ttl=config.redis.ai_ttl,
     )
     app.extensions["xplagiax_cache"] = cache
 
@@ -321,4 +323,5 @@ def _build_api_rotator(config: AppConfig, cache, redis_client=None):
         redis_client=redis_client,
         circuit_failure_threshold=config.api_rotator.circuit_failure_threshold,
         circuit_recovery_s=config.api_rotator.circuit_recovery_s,
+        cache=cache,
     )

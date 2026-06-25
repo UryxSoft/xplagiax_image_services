@@ -720,6 +720,66 @@ class TestSSRFGuards(unittest.TestCase):
 
 
 # ===========================================================================
+# TestResultCaches — float32 embeddings + reverse/AI result caches
+# ===========================================================================
+
+class _FakeRedis:
+    """Minimal in-memory stand-in for redis.Redis (bytes/str values)."""
+    def __init__(self):
+        self.store = {}
+    def ping(self):
+        return True
+    def setex(self, key, ttl, value):
+        self.store[key] = value
+    def get(self, key):
+        return self.store.get(key)
+
+
+class TestResultCaches(unittest.TestCase):
+
+    def setUp(self):
+        p = patch("app.cache.redis_client.get_metrics", return_value=MagicMock())
+        p.start(); self.addCleanup(p.stop)
+
+    def _cache(self):
+        from app.cache.redis_client import CacheClient
+        fake = _FakeRedis()
+        with patch("redis.ConnectionPool"), patch("redis.Redis", return_value=fake):
+            return CacheClient(
+                host="x", port=1, password=None, db=0, socket_timeout=0.1,
+                embedding_ttl=10, result_ttl=10, job_ttl=10,
+            )
+
+    def test_embedding_float32_roundtrip(self):
+        c = self._cache()
+        vec = [0.1, -0.5, 0.3333333, 1.0, 0.0]
+        self.assertTrue(c.set_embedding(digest="abc", vector=vec))
+        out = c.get_embedding(digest="abc")
+        self.assertEqual(len(out), len(vec))
+        for a, b in zip(out, vec):
+            self.assertAlmostEqual(a, b, places=5)
+
+    def test_embedding_miss_returns_none(self):
+        self.assertIsNone(self._cache().get_embedding(digest="missing"))
+
+    def test_embedding_key_is_versioned(self):
+        from app.cache.redis_client import CacheClient
+        self.assertIn(":v2:", CacheClient.embedding_key(b"x"))
+
+    def test_reverse_cache_roundtrip(self):
+        c = self._cache()
+        data = {"found_on_internet": True, "matches": [{"link": "x"}]}
+        self.assertTrue(c.set_reverse("k", data))
+        self.assertEqual(c.get_reverse("k"), data)
+
+    def test_ai_detection_cache_roundtrip(self):
+        c = self._cache()
+        data = {"is_ai": True, "confidence": 0.9}
+        self.assertTrue(c.set_ai_detection("digest", data))
+        self.assertEqual(c.get_ai_detection("digest"), data)
+
+
+# ===========================================================================
 # TestConfigDefaults — new configurable knobs
 # ===========================================================================
 

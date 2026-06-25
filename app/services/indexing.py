@@ -236,24 +236,20 @@ class IndexingService:
         from app.storage.vector_repository import ImagePoint
 
         try:
-            # CLIP embedding
-            embed_result = self._models.embed_single(pil_image)
-
-            # AI detection (optional)
+            # CLIP embedding ∥ SigLIP detection (run concurrently)
+            embed_result, cls = self._models.embed_and_classify(
+                pil_image, run_ai_detection=run_ai_detection
+            )
             ai_result = None
-            if run_ai_detection and self._models.siglip_ready:
-                try:
-                    cls = self._models.classify_single(pil_image)
-                    ai_result = {
-                        "is_ai":        cls.is_ai,
-                        "is_human":     cls.is_human,
-                        "label":        cls.label,
-                        "confidence":   cls.confidence,
-                        "ai_score":     cls.ai_score,
-                        "human_score":  cls.human_score,
-                    }
-                except Exception as exc:
-                    logger.warning("siglip_failed_degraded", error=str(exc))
+            if cls is not None:
+                ai_result = {
+                    "is_ai":        cls.is_ai,
+                    "is_human":     cls.is_human,
+                    "label":        cls.label,
+                    "confidence":   cls.confidence,
+                    "ai_score":     cls.ai_score,
+                    "human_score":  cls.human_score,
+                }
 
             # Build and upsert point
             point = ImagePoint(
@@ -278,8 +274,8 @@ class IndexingService:
             )
             point_id = self._repo.upsert(point)
 
-            # Cache the embedding for future searches of this same image
-            self._cache.set_embedding(image_bytes, embed_result.vector)
+            # Cache the embedding for future searches (reuse the hash we have)
+            self._cache.set_embedding(digest=content_hash, vector=embed_result.vector)
 
             elapsed_ms = (time.perf_counter() - start) * 1000
             get_metrics().jobs_completed.labels(job_type="index", status="done").inc()

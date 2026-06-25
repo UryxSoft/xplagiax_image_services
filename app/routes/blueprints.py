@@ -495,6 +495,17 @@ def analyze_ai_detection():
     if err:
         return jsonify(err), code
 
+    # Result cache: classification is deterministic for identical bytes → skip
+    # re-running SigLIP for the same image.
+    cache = _svc("cache")
+    digest = hashlib.sha256(image_bytes).hexdigest()
+    if cache and cache.available:
+        cached = cache.get_ai_detection(digest)
+        if cached is not None:
+            cached = dict(cached)
+            cached["cached"] = True
+            return jsonify(cached), 200
+
     try:
         models = _svc("models")
         if not models.siglip_ready:
@@ -511,7 +522,7 @@ def analyze_ai_detection():
                 }), 503
 
         result = models.classify_single(pil_image)
-        return jsonify({
+        payload = {
             "is_ai":            result.is_ai,
             "is_human":         result.is_human,
             "is_uncertain":     result.is_uncertain,
@@ -528,7 +539,11 @@ def analyze_ai_detection():
                 "cropped, screenshotted or out-of-distribution images. Do not "
                 "treat as definitive proof."
             ),
-        }), 200
+        }
+        if cache and cache.available:
+            cache.set_ai_detection(digest, payload)
+        payload["cached"] = False
+        return jsonify(payload), 200
     except Exception as exc:
         logger.error("ai_detection_failed", error=str(exc), exc_info=True)
         return jsonify({
@@ -565,6 +580,7 @@ def patent_search_by_image():
     # If image_url is a local path or external URL we shouldn't base64 it necessarily unless it's a file
     # _parse_image_upload will handle path retrieval seamlessly.
     storage_key = None
+    cache_key = None
     try:
         if not image_url or "file" in request.files or params.get("image_path"):
             raw, pil_image, filename, err, code = _parse_image_upload(required=True, params=params)
@@ -578,6 +594,7 @@ def patent_search_by_image():
             storage_key = storage.save(raw, content_hash, "temp_search", filename, fmt)
             image_url = storage.get_url(storage_key, expiry_seconds=3600)
             _warn_if_unreachable(image_url)
+            cache_key = content_hash
 
             # Explicitly free memory for large variables
             del raw, pil_image
@@ -585,7 +602,10 @@ def patent_search_by_image():
         if not image_url:
             return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
 
-        results = rotator.patent_image_search(image_url, num_results)
+        if cache_key is None:
+            cache_key = hashlib.sha256(image_url.encode()).hexdigest()
+
+        results = rotator.patent_image_search(image_url, num_results, cache_key=cache_key)
         return jsonify({
             "status": "success",
             "results": results,
@@ -655,6 +675,7 @@ def reverse_image_search():
     num_results = min(int(params.get("num_results", 10)), 50)
 
     storage_key = None
+    cache_key = None
     try:
         if not image_url or "file" in request.files or params.get("image_path"):
             raw, pil_image, filename, err, code = _parse_image_upload(required=True, params=params)
@@ -668,6 +689,7 @@ def reverse_image_search():
             storage_key = storage.save(raw, content_hash, "temp_search", filename, fmt)
             image_url = storage.get_url(storage_key, expiry_seconds=3600)
             _warn_if_unreachable(image_url)
+            cache_key = content_hash
 
             # Explicitly free memory for large variables
             del raw, pil_image
@@ -675,7 +697,10 @@ def reverse_image_search():
         if not image_url:
             return jsonify({"error": "Provide 'file', 'image_path' or 'image_url'", "code": "MISSING_INPUT"}), 400
 
-        results = rotator.reverse_image_search(image_url, num_results)
+        if cache_key is None:
+            cache_key = hashlib.sha256(image_url.encode()).hexdigest()
+
+        results = rotator.reverse_image_search(image_url, num_results, cache_key=cache_key)
         return jsonify({
             "status": "success",
             "results": results,

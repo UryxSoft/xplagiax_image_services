@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies (no heavy ML wheels)
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask werkzeug Pillow redis structlog prometheus-client \
+                      tenacity numpy imagehash qdrant-client requests
+      - name: Run logic + integration tests (ML libs stubbed)
+        run: |
+          mkdir -p .ci_stubs
+          cat > .ci_stubs/sitecustomize.py <<'PY'
+          import sys, types
+          torch = types.ModuleType("torch")
+          torch.qint8 = "qint8"; torch.float32 = "float32"
+          torch.set_num_threads = lambda *a, **k: None
+          torch.set_num_interop_threads = lambda *a, **k: None
+          torch.device = lambda *a, **k: "cpu"
+          class _IM:
+              def __call__(self, *a, **k):
+                  if a and callable(a[0]): return a[0]
+                  return (lambda f: f)
+              def __enter__(self): return self
+              def __exit__(self, *a): return False
+          torch.inference_mode = _IM(); torch.no_grad = _IM()
+          cuda = types.ModuleType("torch.cuda"); cuda.is_available = lambda: False; torch.cuda = cuda
+          nn = types.ModuleType("torch.nn"); nn.Linear = type("Linear", (), {}); torch.nn = nn
+          q = types.ModuleType("torch.quantization"); q.quantize_dynamic = lambda m,*a,**k: m; torch.quantization = q
+          torch.softmax = lambda *a, **k: None
+          for n,m in {"torch":torch,"torch.cuda":cuda,"torch.nn":nn,"torch.quantization":q}.items(): sys.modules[n]=m
+          tr = types.ModuleType("transformers")
+          tr.AutoImageProcessor = type("AutoImageProcessor", (), {"from_pretrained": classmethod(lambda c,*a,**k: None)})
+          tr.AutoModelForImageClassification = type("AutoModelForImageClassification", (), {"from_pretrained": classmethod(lambda c,*a,**k: None)})
+          sys.modules["transformers"] = tr
+          st = types.ModuleType("sentence_transformers"); st.SentenceTransformer = type("SentenceTransformer", (), {})
+          sys.modules["sentence_transformers"] = st
+          PY
+          PYTHONPATH="$PWD/.ci_stubs:$PWD" python -m unittest tests.test_suite -v
+
+  security-scan:
+    name: Dependency vulnerability scan (SCA)
+    runs-on: ubuntu-latest
+    continue-on-error: true          # informational — does not block merges yet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip-audit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt --desc || true

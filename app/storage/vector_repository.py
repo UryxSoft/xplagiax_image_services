@@ -89,7 +89,7 @@ class VectorRepository:
     Business logic lives in the service layer, not here.
     """
 
-    EMBEDDING_DIM = 512
+    EMBEDDING_DIM = 512   # default; overridable per-instance via embedding_dim
 
     def __init__(
         self,
@@ -97,12 +97,14 @@ class VectorRepository:
         port: int,
         collection: str,
         api_key: Optional[str],
+        embedding_dim: int = 512,
         hnsw_m: int = 16,
         hnsw_ef_construct: int = 200,
         hnsw_ef_search: int = 128,
         full_scan_threshold: int = 10_000,
     ) -> None:
         self._collection = collection
+        self._embedding_dim = embedding_dim
         self._hnsw_ef_search = hnsw_ef_search
 
         if host == ":memory:":
@@ -144,7 +146,7 @@ class VectorRepository:
         self._client.create_collection(
             collection_name=self._collection,
             vectors_config=qmodels.VectorParams(
-                size=self.EMBEDDING_DIM,
+                size=self._embedding_dim,
                 distance=qmodels.Distance.COSINE,
                 hnsw_config=qmodels.HnswConfigDiff(
                     m=hnsw_m,
@@ -510,7 +512,7 @@ class VectorRepository:
     def health_check(self) -> dict:
         """Perform a lightweight check: can we issue a search?"""
         try:
-            dummy = [0.0] * self.EMBEDDING_DIM
+            dummy = [0.0] * self._embedding_dim
             dummy[0] = 1.0
             self._client.search(
                 collection_name=self._collection,

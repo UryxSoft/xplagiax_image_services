@@ -301,7 +301,7 @@ class TestApiRotatorScoring(unittest.TestCase):
         import datetime
         score = self._make_score()
         # Set penalty to past
-        score.penalty_until = datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
+        score.penalty_until = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
         self.assertFalse(score.is_penalised)  # auto-clears
 
     def test_mixed_success_failure_scores_reasonably(self):
@@ -717,6 +717,27 @@ class TestSSRFGuards(unittest.TestCase):
     def test_garbage_is_unsafe(self):
         from app.security.http_client import is_safe_ip
         self.assertFalse(is_safe_ip("not-an-ip"))
+
+
+# ===========================================================================
+# TestConfigDefaults — new configurable knobs
+# ===========================================================================
+
+class TestConfigDefaults(unittest.TestCase):
+
+    def test_embedding_dim_default(self):
+        from app.config import load_config
+        self.assertEqual(load_config().qdrant.embedding_dim, 512)
+
+    def test_embedding_dim_override(self):
+        import os
+        from app.config import load_config
+        with patch.dict(os.environ, {"CLIP_EMBEDDING_DIM": "768"}):
+            self.assertEqual(load_config().qdrant.embedding_dim, 768)
+
+    def test_reverse_engine_default_google_lens(self):
+        from app.config import load_config
+        self.assertEqual(load_config().api_rotator.reverse_engine, "google_lens")
 
 
 # ===========================================================================

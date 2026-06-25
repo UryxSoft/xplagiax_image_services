@@ -138,6 +138,7 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
         port=config.qdrant.port,
         collection=config.qdrant.collection,
         api_key=config.qdrant.api_key,
+        embedding_dim=config.qdrant.embedding_dim,
         hnsw_m=config.qdrant.hnsw_m,
         hnsw_ef_construct=config.qdrant.hnsw_ef_construct,
         hnsw_ef_search=config.qdrant.hnsw_ef_search,

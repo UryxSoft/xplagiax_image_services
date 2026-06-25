@@ -77,6 +77,8 @@ class QdrantConfig:
     port: int
     collection: str
     api_key: Optional[str]
+    # Vector dimension — must match the CLIP model (clip-ViT-B-32 = 512)
+    embedding_dim: int = 512
     # HNSW tuning — higher ef_construct / m = better recall, slower indexing
     hnsw_m: int = 16
     hnsw_ef_construct: int = 200
@@ -211,6 +213,7 @@ def load_config() -> AppConfig:
         port=_optional_int("QDRANT_PORT", 6333),
         collection=_optional("QDRANT_COLLECTION", "xplagiax_images"),
         api_key=_optional("QDRANT_API_KEY") or None,
+        embedding_dim=_optional_int("CLIP_EMBEDDING_DIM", 512),
         hnsw_m=_optional_int("QDRANT_HNSW_M", 16),
         hnsw_ef_construct=_optional_int("QDRANT_HNSW_EF_CONSTRUCT", 200),
         hnsw_ef_search=_optional_int("QDRANT_HNSW_EF_SEARCH", 128),

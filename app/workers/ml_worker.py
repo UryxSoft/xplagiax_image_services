@@ -94,6 +94,7 @@ def _init_worker():
         port=cfg.qdrant.port,
         collection=cfg.qdrant.collection,
         api_key=cfg.qdrant.api_key,
+        embedding_dim=cfg.qdrant.embedding_dim,
         hnsw_m=cfg.qdrant.hnsw_m,
         hnsw_ef_construct=cfg.qdrant.hnsw_ef_construct,
         hnsw_ef_search=cfg.qdrant.hnsw_ef_search,

@@ -98,7 +98,7 @@ class ProviderScore:
             self._recalculate()
 
     def penalise(self, duration_seconds: int = 3600) -> None:
-        self.penalty_until = datetime.datetime.utcnow() + datetime.timedelta(
+        self.penalty_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
             seconds=duration_seconds
         )
         self.score = 0.0
@@ -112,7 +112,7 @@ class ProviderScore:
     def is_penalised(self) -> bool:
         if self.penalty_until is None:
             return False
-        if datetime.datetime.utcnow() > self.penalty_until:
+        if datetime.datetime.now(datetime.timezone.utc) > self.penalty_until:
             self.penalty_until = None  # auto-recover
             return False
         return True
@@ -149,7 +149,7 @@ class UsageTracker:
         self._lock = threading.Lock()
 
     def _year_month(self) -> str:
-        return datetime.datetime.utcnow().strftime("%Y-%m")
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
 
     def increment(self, provider: str) -> int:
         """Atomically increment and return new count."""
@@ -563,7 +563,7 @@ class SmartApiRotator:
 
     def get_usage_status(self) -> dict:
         status = {}
-        ym = datetime.datetime.utcnow().strftime("%Y-%m")
+        ym = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
         for name, cfg in self._providers.items():
             used = self._usage.get_count(name)
             score_obj = self._scores[name]

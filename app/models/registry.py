@@ -22,9 +22,13 @@ import numpy as np
 import torch
 from PIL import Image
 from sentence_transformers import SentenceTransformer
-from transformers import AutoImageProcessor, SiglipForImageClassification
+# AutoModel makes the AI-detector backbone-agnostic: SigLIP, ViT, Swin, etc.
+# all work, so a lighter model can be dropped in via SIGLIP_MODEL_ID.
+from transformers import AutoImageProcessor, AutoModelForImageClassification
 
 from app.observability.telemetry import get_logger, get_metrics
+# Pure, torch-free label resolution (testable in isolation).
+from app.models.labels import resolve_label_semantics
 
 logger = get_logger(__name__)
 
@@ -84,6 +88,11 @@ class ModelRegistry:
         clip_model_id: str,
         device: str,
         max_batch_size: int = 8,
+        ai_confidence_high: float = 0.85,
+        ai_confidence_med: float = 0.60,
+        ai_temperature: float = 1.0,
+        max_concurrency: int = 2,
+        ai_label_map: Optional[dict] = None,
     ) -> None:
         # Forzar CPU si se pide "auto" y no hay CUDA
         if device == "auto":
@@ -95,14 +104,24 @@ class ModelRegistry:
         self._max_batch_size = max_batch_size
         self._use_quantization = (str(self._device) == "cpu")
 
+        # AI-detection calibration / thresholds
+        self._ai_high = ai_confidence_high
+        self._ai_med = ai_confidence_med
+        self._ai_temperature = max(1e-3, ai_temperature)
+        self._ai_label_map = ai_label_map
+
+        # Bound concurrent inferences to protect RAM/CPU under load.
+        self._infer_sema = threading.BoundedSemaphore(max(1, max_concurrency))
+
         # Ruta de modelos quantizados pre-calculados
         hf_home = os.environ.get("HF_HOME", "/app/.cache/huggingface")
         self._quantized_dir = os.path.join(hf_home, "quantized")
         self._quantized_flag = os.path.join(self._quantized_dir, "quantized.flag")
 
-        self._siglip: Optional[SiglipForImageClassification] = None
-        self._processor: Optional[AutoImageProcessor] = None
+        self._siglip: Optional[Any] = None
+        self._processor: Optional[Any] = None
         self._clip: Optional[SentenceTransformer] = None
+        self._label_semantics: Optional[dict] = None   # idx -> 'ai' | 'human'
 
         self._siglip_status = ModelStatus(name=siglip_model_id, loaded=False, device=device)
         self._clip_status   = ModelStatus(name=clip_model_id,   loaded=False, device=device)
@@ -173,19 +192,32 @@ class ModelRegistry:
             os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
 
             self._processor = AutoImageProcessor.from_pretrained(self._siglip_model_id)
-            self._siglip = SiglipForImageClassification.from_pretrained(
-                self._siglip_model_id,
-                torch_dtype=torch.float32,
-                low_cpu_mem_usage=False,   # carga eficiente — no duplica en RAM
-            )
+            try:
+                # low_cpu_mem_usage streams weights → lower RAM peak (needs accelerate)
+                self._siglip = AutoModelForImageClassification.from_pretrained(
+                    self._siglip_model_id,
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True,
+                )
+            except (ImportError, ValueError) as exc:
+                logger.warning("siglip_low_cpu_mem_unavailable", error=str(exc))
+                self._siglip = AutoModelForImageClassification.from_pretrained(
+                    self._siglip_model_id,
+                    torch_dtype=torch.float32,
+                )
             self._siglip.to(self._device)
             self._siglip.eval()
+
+            # Resolve label→{ai,human} once; fail loud if unrecognised.
+            self._label_semantics = resolve_label_semantics(
+                self._siglip.config.id2label, self._ai_label_map
+            )
 
             # GPU: FP16 para velocidad
             if str(self._device) == "cuda":
                 self._siglip = self._siglip.half()
 
-            # CPU: quantización dinámica INT8
+            # CPU: quantización dinámica INT8 (~50% menos RAM, sin GPU)
             if self._use_quantization:
                 self._siglip = torch.quantization.quantize_dynamic(
                     self._siglip,
@@ -233,13 +265,14 @@ class ModelRegistry:
             batch = images[i: i + batch_size]
             start = time.perf_counter()
 
-            embeddings = self._clip.encode(
-                batch,
-                batch_size=len(batch),
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
+            with self._infer_sema:
+                embeddings = self._clip.encode(
+                    batch,
+                    batch_size=len(batch),
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
 
             elapsed_ms = (time.perf_counter() - start) * 1000
             get_metrics().clip_inference_duration.labels(
@@ -263,58 +296,59 @@ class ModelRegistry:
     def classify_ai_human(self, images: list[Image.Image]) -> list[ClassificationResult]:
         if self._siglip is None:
             raise RuntimeError(f"SigLIP no cargado: {self._siglip_status.error}")
+        if not self._label_semantics:
+            raise RuntimeError("AI detector labels unresolved — model not ready.")
 
         results = []
         batch_size = min(len(images), self._max_batch_size)
+        id2label = self._siglip.config.id2label
+        sem = self._label_semantics
+        t = self._ai_temperature
 
         for i in range(0, len(images), batch_size):
             batch = images[i: i + batch_size]
             start = time.perf_counter()
 
-            inputs = self._processor(images=batch, return_tensors="pt").to(self._device)
-            outputs = self._siglip(**inputs)
-            probs = torch.softmax(outputs.logits.float(), dim=-1).cpu().numpy()
+            # Concurrency guard: bound simultaneous inferences to protect RAM.
+            with self._infer_sema:
+                inputs = self._processor(images=batch, return_tensors="pt").to(self._device)
+                outputs = self._siglip(**inputs)
+                # Temperature scaling calibrates over-confident logits (T>1 softens).
+                logits = outputs.logits.float() / t
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()
 
             elapsed_ms = (time.perf_counter() - start) * 1000
             get_metrics().siglip_inference_duration.labels(
                 batch_size=str(len(batch))
             ).observe(elapsed_ms / 1000)
 
-            id2label = self._siglip.config.id2label
             for prob_row in probs:
-                scores = {id2label[i]: float(p) for i, p in enumerate(prob_row)}
-                # Recalibrate scores by summing all AI-related probabilities
-                ai_related_labels = ("ai", "artificial", "generated", "fake")
-                ai_score = sum(v for k, v in scores.items() if k.lower() in ai_related_labels)
-                human_score = sum(v for k, v in scores.items() if k.lower() not in ai_related_labels)
-                
-                # Normalize just in case
+                scores = {id2label[idx]: float(p) for idx, p in enumerate(prob_row)}
+                # Aggregate by resolved semantics (handles >2 classes correctly).
+                ai_score = sum(float(p) for idx, p in enumerate(prob_row) if sem[idx] == "ai")
+                human_score = sum(float(p) for idx, p in enumerate(prob_row) if sem[idx] == "human")
                 total = ai_score + human_score
                 if total > 0:
                     ai_score /= total
                     human_score /= total
 
-                # Threshold enforcement configurable via ENV (default 0.85)
-                threshold_high = float(os.environ.get("AI_CONFIDENCE_HIGH", "0.85"))
-                threshold_med = float(os.environ.get("AI_CONFIDENCE_MED", "0.60"))
-                
-                is_ai = ai_score >= threshold_high
-                is_human = human_score >= threshold_high
+                is_ai = ai_score >= self._ai_high
+                is_human = human_score >= self._ai_high
                 is_uncertain = not is_ai and not is_human
-                
+
                 max_score = max(ai_score, human_score)
-                if max_score >= threshold_high:
+                if max_score >= self._ai_high:
                     bucket = "HIGH"
-                elif max_score >= threshold_med:
+                elif max_score >= self._ai_med:
                     bucket = "MEDIUM"
                 else:
                     bucket = "LOW"
-                
+
                 get_metrics().siglip_confidence.observe(max_score)
                 results.append(ClassificationResult(
                     is_ai=is_ai, is_human=is_human, is_uncertain=is_uncertain,
                     confidence_bucket=bucket,
-                    label="ai" if ai_score > human_score else "human", 
+                    label="ai" if ai_score > human_score else "human",
                     confidence=max_score,
                     ai_score=round(ai_score, 6),
                     human_score=round(human_score, 6),
@@ -371,6 +405,12 @@ class ModelRegistry:
                     list(self._siglip.config.id2label.values())
                     if self._siglip else []
                 ),
+                "label_semantics": self._label_semantics,
+                "calibration": {
+                    "temperature":     self._ai_temperature,
+                    "threshold_high":  self._ai_high,
+                    "threshold_med":   self._ai_med,
+                },
             },
             "device":             str(self._device),
             "threads":            _NUM_THREADS,

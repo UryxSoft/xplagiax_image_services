@@ -192,9 +192,11 @@ class SeaweedFSFilerStorage(ImageStorage):
     SeaweedFS volume layer. Paths are human-readable and match the same
     key format used by LocalImageStorage, making backend migration trivial.
 
-    Idempotency: HEAD before PUT — skips re-upload for same content_hash.
-    Replication: handled transparently by the volume layer.
-    TTL: set per-collection in filer config, not per-request.
+    Idempotency: storage keys embed the SHA-256 content hash, so the same bytes
+    always map to the same immutable key (a re-upload simply overwrites identical
+    content). Replication is handled transparently by the volume layer.
+    TTL: passed per-request so transient uploads (temp_search) auto-expire even
+    if a process crashes before explicit cleanup.
 
     Port: 8888 (default SeaweedFS filer port)
     """
@@ -207,6 +209,7 @@ class SeaweedFSFilerStorage(ImageStorage):
         public_url: str,
         replication: str = "000",
         collection: str = "",
+        ttl: str = "",
         request_timeout: float = 30.0,
         max_retries: int = 3,
     ) -> None:
@@ -214,6 +217,7 @@ class SeaweedFSFilerStorage(ImageStorage):
         self._public_url = public_url.rstrip("/")
         self._replication = replication
         self._collection = collection
+        self._ttl = ttl
         self._session = _make_session(timeout=request_timeout, max_retries=max_retries)
         self._timeout = request_timeout
         logger.info(
@@ -222,6 +226,7 @@ class SeaweedFSFilerStorage(ImageStorage):
             public_url=self._public_url,
             replication=replication,
             collection=collection or "default",
+            ttl=ttl or "permanent",
         )
 
     def _url(self, storage_key: str) -> str:
@@ -236,6 +241,8 @@ class SeaweedFSFilerStorage(ImageStorage):
             params["replication"] = self._replication
         if self._collection:
             params["collection"] = self._collection
+        if self._ttl:
+            params["ttl"] = self._ttl   # auto-expiry backstop for temp uploads
 
         start = time.perf_counter()
         resp = self._session.put(
@@ -535,6 +542,7 @@ def create_storage(
             public_url=seaweedfs_public_url or seaweedfs_filer_url,
             replication=seaweedfs_replication,
             collection=seaweedfs_collection,
+            ttl=seaweedfs_ttl,
             request_timeout=seaweedfs_request_timeout,
             max_retries=seaweedfs_max_retries,
         )

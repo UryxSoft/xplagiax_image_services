@@ -18,13 +18,14 @@ def fetch_image_bytes(
     file_upload: Optional[FileStorage] = None,
     image_url: Optional[str] = None,
     image_path: Optional[str] = None,
-    max_bytes: int = 20 * 1024 * 1024
+    max_bytes: int = 20 * 1024 * 1024,
+    allow_local_path: bool = False,
 ) -> Tuple[bytes, str]:
     """
     Fetches image bytes from the first available source:
     1. file_upload (multipart form data)
-    2. image_url (http/https)
-    3. image_path (local filesystem)
+    2. image_url (http/https, SSRF-safe)
+    3. image_path (local filesystem) — only if allow_local_path=True
 
     Returns:
         (image_bytes, filename)
@@ -54,6 +55,11 @@ def fetch_image_bytes(
             raise ImageValidationError(f"Failed to download image: {str(e)}")
 
     if image_path:
+        if not allow_local_path:
+            raise ImageValidationError(
+                "Local filesystem image paths are disabled. "
+                "Provide a file upload or an http(s) image_url."
+            )
         if not os.path.isabs(image_path):
             raise ImageValidationError("Local image path must be an absolute path.")
         if not os.path.exists(image_path):

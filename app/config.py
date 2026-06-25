@@ -9,6 +9,7 @@ across the codebase — single source of truth.
 from __future__ import annotations
 
 import os
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -103,6 +104,14 @@ class ModelConfig:
     device: str               # "cuda", "cpu", or "auto"
     max_batch_size: int
     inference_timeout_s: float
+    # AI-detection thresholds & calibration
+    ai_confidence_high: float = 0.85
+    ai_confidence_med: float = 0.60
+    ai_temperature: float = 1.0          # >1 softens over-confident logits (calibration)
+    # Cap concurrent inferences to protect RAM under load
+    inference_max_concurrency: int = 2
+    # Optional override mapping label/index -> 'ai'|'human' (for swapping models)
+    ai_label_map: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -118,16 +127,29 @@ class ApiRotatorConfig:
     zenserp_limit: int
     # Health check interval in seconds
     health_check_interval: int
+    # SerpApi reverse-image engine: "google_lens" (recommended) | "google_reverse_image"
+    reverse_engine: str = "google_lens"
+    # Distributed circuit breaker (Redis-backed)
+    circuit_failure_threshold: int = 5
+    circuit_recovery_s: int = 120
 
 
 @dataclass(frozen=True)
 class SecurityConfig:
     api_key: Optional[str]              # None = auth disabled (dev only)
+    admin_api_key: Optional[str]        # separate key for destructive admin ops
     require_auth: bool
     max_image_bytes: int                # hard reject above this
+    max_image_pixels: int              # decompression-bomb guard (W*H)
     allowed_mime_types: frozenset
     rate_limit_per_minute: int
     rate_limit_per_hour: int
+    # Trusted reverse-proxy CIDRs/IPs whose X-Forwarded-For we honour
+    trusted_proxies: tuple
+    # Number of proxies in front of the app (for werkzeug ProxyFix)
+    trusted_proxy_count: int
+    # Allow reading images from local absolute filesystem paths (LFI risk → off in prod)
+    allow_local_image_path: bool
 
 
 @dataclass(frozen=True)
@@ -208,6 +230,17 @@ def load_config() -> AppConfig:
 
     device = _optional("MODEL_DEVICE", "auto")
 
+    ai_label_map_raw = _optional("AI_LABEL_MAP")
+    ai_label_map = None
+    if ai_label_map_raw:
+        try:
+            ai_label_map = json.loads(ai_label_map_raw)
+            if not isinstance(ai_label_map, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Invalid AI_LABEL_MAP (%s) — ignoring: %s", ai_label_map_raw, exc)
+            ai_label_map = None
+
     model = ModelConfig(
         siglip_model_id=_optional(
             "SIGLIP_MODEL_ID", "Ateeqq/ai-vs-human-image-detector"
@@ -216,15 +249,20 @@ def load_config() -> AppConfig:
         device=device,
         max_batch_size=_optional_int("MODEL_MAX_BATCH_SIZE", 32),
         inference_timeout_s=_optional_float("MODEL_INFERENCE_TIMEOUT", 30.0),
+        ai_confidence_high=_optional_float("AI_CONFIDENCE_HIGH", 0.85),
+        ai_confidence_med=_optional_float("AI_CONFIDENCE_MED", 0.60),
+        ai_temperature=_optional_float("AI_TEMPERATURE", 1.0),
+        inference_max_concurrency=_optional_int("INFERENCE_MAX_CONCURRENCY", 2),
+        ai_label_map=ai_label_map,
     )
 
-    #serpapi_key = _optional("SERPAPI_KEY") or None
-    #zenserp_key = _optional("ZENSERP_KEY") or None
-    serpapi_key='18d0a89227e075bb1903ccf7453caff6205dc390687411edda0319d7066f58d0'
-    zenserp_key='a9739160-ebe3-11f0-83d4-b9ca31f7dc25'
-    if not serpapi_key:
+    # Secrets are ALWAYS read from the environment — never hardcoded.
+    serpapi_key = _optional("SERPAPI_KEY") or None
+    zenserp_key = _optional("ZENSERP_KEY") or None
+    if not serpapi_key and not zenserp_key:
         logger.warning(
-            "SERPAPI_KEY not set — reverse image search will be unavailable"
+            "No reverse-image provider key set (SERPAPI_KEY / ZENSERP_KEY) — "
+            "reverse image search will be unavailable"
         )
 
     api_rotator = ApiRotatorConfig(
@@ -237,25 +275,40 @@ def load_config() -> AppConfig:
         serpapi_limit=_optional_int("SERPAPI_MONTHLY_LIMIT", 250),
         zenserp_limit=_optional_int("ZENSERP_MONTHLY_LIMIT", 50),
         health_check_interval=_optional_int("API_HEALTH_CHECK_INTERVAL", 300),
+        reverse_engine=_optional("REVERSE_IMAGE_ENGINE", "google_lens"),
+        circuit_failure_threshold=_optional_int("API_CIRCUIT_FAILURE_THRESHOLD", 5),
+        circuit_recovery_s=_optional_int("API_CIRCUIT_RECOVERY_S", 120),
     )
 
     require_auth = _optional_bool("REQUIRE_AUTH", False)
     api_key = _optional("SERVICE_API_KEY") or None
+    admin_api_key = _optional("ADMIN_API_KEY") or None
     if require_auth and not api_key:
         raise EnvironmentError(
             "REQUIRE_AUTH=true but SERVICE_API_KEY is not set. "
             "Either set SERVICE_API_KEY or set REQUIRE_AUTH=false (dev only)."
         )
 
+    trusted_proxies = tuple(
+        p.strip()
+        for p in _optional("TRUSTED_PROXIES", "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16").split(",")
+        if p.strip()
+    )
+
     security = SecurityConfig(
         api_key=api_key,
+        admin_api_key=admin_api_key,
         require_auth=require_auth,
         max_image_bytes=_optional_int("MAX_IMAGE_BYTES", 20 * 1024 * 1024),  # 20 MB
+        max_image_pixels=_optional_int("MAX_IMAGE_PIXELS", 40_000_000),      # 40 MP
         allowed_mime_types=frozenset(
             _optional("ALLOWED_MIME_TYPES", "jpeg,png,webp,bmp,tiff,gif").split(",")
         ),
         rate_limit_per_minute=_optional_int("RATE_LIMIT_PER_MINUTE", 30),
         rate_limit_per_hour=_optional_int("RATE_LIMIT_PER_HOUR", 500),
+        trusted_proxies=trusted_proxies,
+        trusted_proxy_count=_optional_int("TRUSTED_PROXY_COUNT", 1),
+        allow_local_image_path=_optional_bool("ALLOW_LOCAL_IMAGE_PATH", False),
     )
 
     storage = StorageConfig(

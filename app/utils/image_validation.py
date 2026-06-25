@@ -18,11 +18,16 @@ from typing import Optional, Tuple
 
 from PIL import Image, UnidentifiedImageError
 
-Image.MAX_IMAGE_PIXELS = 100_000_000  # Protection against Decompression Bombs
+# Hard ceiling enforced by Pillow itself (raises DecompressionBombError above it).
+# The per-request limit (max_pixels) is usually stricter; this is a backstop.
+Image.MAX_IMAGE_PIXELS = 64_000_000  # ~64 MP backstop against decompression bombs
 
 from app.observability.telemetry import get_logger
 
 logger = get_logger(__name__)
+
+_DEFAULT_MAX_PIXELS = 40_000_000   # 40 MP — validated BEFORE decoding pixels
+_MAX_FRAMES = 1                    # reject animated/multi-page (GIF/TIFF) bombs
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -57,6 +62,7 @@ def validate_and_load(
     file_bytes: bytes,
     max_bytes: int = 20 * 1024 * 1024,
     allowed_mimes: Optional[frozenset] = None,
+    max_pixels: int = _DEFAULT_MAX_PIXELS,
 ) -> Tuple[Image.Image, str]:
     """
     Validate image bytes and return a loaded PIL Image + detected mime type.
@@ -65,8 +71,9 @@ def validate_and_load(
       1. Size limit
       2. Magic byte detection
       3. Mime allowlist
-      4. PIL open + verify (catches truncated files)
-      5. Minimum dimension check
+      4. Header parse (lazy) → dimension + pixel-count + frame checks
+         BEFORE decoding pixels (prevents decompression-bomb RAM blow-up)
+      5. Integrity verify() then decode to RGB
 
     Returns:
         (PIL.Image in RGB mode, detected_mime_type)
@@ -102,35 +109,47 @@ def validate_and_load(
             f"Accepted: {', '.join(sorted(allowed_mimes))}"
         )
 
-    # --- 4. PIL integrity ---
+    # --- 4. Header inspection BEFORE decoding (anti decompression bomb) ---
     try:
-        img = Image.open(io.BytesIO(file_bytes))
-        img.verify()  # checks for truncation / corruption
-    except (UnidentifiedImageError, Exception) as exc:
+        with Image.open(io.BytesIO(file_bytes)) as header:
+            w, h = header.size
+            n_frames = getattr(header, "n_frames", 1)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ImageValidationError(f"Corrupt or unreadable image: {exc}") from exc
 
-    # Re-open after verify() (PIL closes the image after verify)
-    try:
-        img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    except Exception as exc:
-        raise ImageValidationError(f"Cannot decode image: {exc}") from exc
-
-    # --- 5. Dimensions ---
-    w, h = img.size
     if w < _MIN_DIMENSION or h < _MIN_DIMENSION:
         raise ImageValidationError(
             f"Image too small: {w}×{h}px (minimum {_MIN_DIMENSION}×{_MIN_DIMENSION}px)"
         )
+    if w * h > max_pixels:
+        raise ImageValidationError(
+            f"Image has too many pixels: {w}×{h} ({w * h / 1_000_000:.1f} MP, "
+            f"max {max_pixels / 1_000_000:.0f} MP)"
+        )
+    if n_frames > _MAX_FRAMES:
+        raise ImageValidationError(
+            f"Animated / multi-page images are not allowed ({n_frames} frames)."
+        )
 
-    # Large images: resize before returning — PIL is lazy, this is cheap
-    if w > _MAX_DIMENSION or h > _MAX_DIMENSION:
+    # --- 5. Integrity verify() + decode ---
+    try:
+        with Image.open(io.BytesIO(file_bytes)) as check:
+            check.verify()  # truncation / corruption
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise ImageValidationError(f"Corrupt or unreadable image: {exc}") from exc
+
+    try:
+        img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise ImageValidationError(f"Cannot decode image: {exc}") from exc
+
+    # Large (but allowed) images: downscale before inference. PIL is lazy → cheap.
+    if img.width > _MAX_DIMENSION or img.height > _MAX_DIMENSION:
         img.thumbnail((_MAX_DIMENSION, _MAX_DIMENSION), Image.LANCZOS)
         logger.info(
             "image_resized_before_inference",
-            original_w=w,
-            original_h=h,
-            new_w=img.width,
-            new_h=img.height,
+            original_w=w, original_h=h,
+            new_w=img.width, new_h=img.height,
         )
 
     return img, detected_mime

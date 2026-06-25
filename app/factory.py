@@ -65,6 +65,14 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
         config = load_config()
     configure_logging(config.observability.log_level, config.observability.log_format)
     logger = get_logger(__name__)
+
+    # Apply debug flag (was previously loaded but never applied).
+    app.debug = config.debug
+
+    # OpenTelemetry tracing — wired only when explicitly enabled.
+    if config.observability.otel_enabled and config.observability.otel_endpoint:
+        from app.observability.telemetry import init_tracing
+        init_tracing(config.observability.service_name, config.observability.otel_endpoint)
     #configure_logging(
     #    log_level=config.observability.log_level,
     #    log_format=config.observability.log_format,
@@ -146,6 +154,11 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
         clip_model_id=config.model.clip_model_id,
         device=config.model.device,
         max_batch_size=config.model.max_batch_size,
+        ai_confidence_high=config.model.ai_confidence_high,
+        ai_confidence_med=config.model.ai_confidence_med,
+        ai_temperature=config.model.ai_temperature,
+        max_concurrency=config.model.inference_max_concurrency,
+        ai_label_map=config.model.ai_label_map,
     )
     app.extensions["xplagiax_models"] = models
 
@@ -200,7 +213,7 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
     # ------------------------------------------------------------------ #
     # 9. API Rotator                                                      #
     # ------------------------------------------------------------------ #
-    api_rotator = _build_api_rotator(config, cache)
+    api_rotator = _build_api_rotator(config, cache, raw_redis)
     app.extensions["xplagiax_api_rotator"] = api_rotator
 
     # ------------------------------------------------------------------ #
@@ -232,6 +245,15 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
         app.wsgi_app,
         max_content_length=config.security.max_image_bytes,
     )
+    # ProxyFix MUST be outermost so REMOTE_ADDR/scheme reflect the real client
+    # before SecurityMiddleware and the rate limiter run.
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=config.security.trusted_proxy_count,
+        x_proto=config.security.trusted_proxy_count,
+        x_host=config.security.trusted_proxy_count,
+    )
     instrument_flask(app)
 
     logger.info(
@@ -250,7 +272,7 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
 # API Rotator factory helper
 # ---------------------------------------------------------------------------
 
-def _build_api_rotator(config: AppConfig, cache):
+def _build_api_rotator(config: AppConfig, cache, redis_client=None):
     from app.services.api_rotator import (
         ProviderConfig,
         SmartApiRotator,
@@ -294,4 +316,8 @@ def _build_api_rotator(config: AppConfig, cache):
         request_timeout_s=config.api_rotator.request_timeout_s,
         max_retries=config.api_rotator.max_retries,
         health_check_interval=config.api_rotator.health_check_interval,
+        reverse_engine=config.api_rotator.reverse_engine,
+        redis_client=redis_client,
+        circuit_failure_threshold=config.api_rotator.circuit_failure_threshold,
+        circuit_recovery_s=config.api_rotator.circuit_recovery_s,
     )

@@ -1,15 +1,24 @@
 """
 Safe HTTP Client for downloading user-provided URLs.
-Protects against SSRF (DNS Rebinding, Redirect Chains, Private IP access)
-and DOS (Infinite Streaming, Decompression Bombs).
+
+Protects against:
+  - SSRF (private/loopback/link-local/metadata IPs, protocol smuggling)
+  - SSRF via DNS rebinding (TOCTOU): we resolve DNS ONCE, validate EVERY
+    resolved IP, and pin the connection to a validated IP so the address used
+    for validation is the exact address used for the request. The hostname is
+    still used for the Host header and TLS SNI/cert validation.
+  - DOS (infinite streaming / oversized bodies): hard byte cap while streaming.
+  - Redirect-based SSRF: redirects are followed manually and each hop is
+    re-validated and re-pinned.
 """
 
-import socket
 import ipaddress
+import socket
 import urllib.parse
-from typing import Iterator
+from typing import List, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException
 
 from app.observability.telemetry import get_logger
@@ -28,37 +37,116 @@ class DownloadLimitExceededError(Exception):
 def is_safe_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
-        # Block private, loopback, multicast, link-local, and unspecified (0.0.0.0)
-        if ip.is_private or ip.is_loopback or ip.is_multicast or ip.is_link_local or ip.is_unspecified:
-            return False
-        return True
     except ValueError:
         return False
+    # Block everything that is not a normal, routable public address.
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_multicast
+        or ip.is_link_local       # covers 169.254.169.254 cloud metadata
+        or ip.is_unspecified
+        or ip.is_reserved
+    )
 
 
-def validate_url_safe(url: str) -> None:
+def _resolve_and_validate(hostname: str, port: int) -> List[str]:
     """
-    Validates that a URL points to a safe public IP.
-    Raises SSRFViolationError if malicious.
-    """
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise SSRFViolationError(f"Protocol {parsed.scheme} is not allowed. Only HTTP/HTTPS.")
+    Resolve the hostname and return the list of safe IPs.
 
+    Security: if ANY resolved address is unsafe we reject the whole hostname.
+    This defeats round-robin / fast-flux rebinding where the attacker mixes a
+    public and a private address in the same DNS response.
+    """
+    try:
+        addrinfo = socket.getaddrinfo(hostname, port, 0, socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise SSRFViolationError(f"DNS resolution failed for {hostname}: {exc}")
+
+    ips = []
+    for *_unused, sockaddr in addrinfo:
+        ip = sockaddr[0]
+        if not is_safe_ip(ip):
+            raise SSRFViolationError(
+                f"Host {hostname} resolved to forbidden IP {ip}"
+            )
+        ips.append(ip)
+
+    if not ips:
+        raise SSRFViolationError(f"Host {hostname} did not resolve to any IP")
+    return ips
+
+
+class _PinnedAdapter(HTTPAdapter):
+    """
+    Transport adapter that forces all connections to a single, pre-validated IP
+    while preserving the original hostname for TLS SNI and certificate checks.
+    """
+
+    def __init__(self, hostname: str, pinned_ip: str, **kwargs):
+        self._hostname = hostname
+        self._pinned_ip = pinned_ip
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        # Validate the cert against the real hostname even though we dial the IP.
+        kwargs["server_hostname"] = self._hostname
+        kwargs["assert_hostname"] = self._hostname
+        super().init_poolmanager(*args, **kwargs)
+
+
+def _pinned_get(url: str, timeout: float):
+    """
+    Issue a single GET to `url`, but force the TCP connection to a validated IP.
+    Returns the streaming Response (caller must close it).
+    """
+    parsed = urllib.parse.urlsplit(url)
     hostname = parsed.hostname
     if not hostname:
         raise SSRFViolationError("URL missing hostname.")
+    default_port = 443 if parsed.scheme == "https" else 80
+    port = parsed.port or default_port
 
+    safe_ips = _resolve_and_validate(hostname, port)
+    pinned_ip = safe_ips[0]
+
+    # Rewrite the netloc to the pinned IP; keep Host header = original hostname.
+    ip_netloc = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
+    if parsed.port:
+        ip_netloc = f"{ip_netloc}:{parsed.port}"
+    pinned_url = urllib.parse.urlunsplit(
+        (parsed.scheme, ip_netloc, parsed.path or "/", parsed.query, "")
+    )
+
+    session = requests.Session()
+    adapter = _PinnedAdapter(hostname=hostname, pinned_ip=pinned_ip)
+    session.mount(f"{parsed.scheme}://{ip_netloc}", adapter)
+
+    headers = {"Host": parsed.netloc, "Accept": "image/*"}
     try:
-        # Resolve all IPs
-        addrinfo = socket.getaddrinfo(hostname, parsed.port or 80, 0, socket.SOCK_STREAM)
-    except socket.gaierror as e:
-        raise SSRFViolationError(f"DNS Resolution failed for {hostname}: {e}")
+        return session.get(
+            pinned_url,
+            headers=headers,
+            stream=True,
+            allow_redirects=False,
+            timeout=timeout,
+        )
+    except RequestException as exc:
+        session.close()
+        raise SSRFViolationError(f"Request failed: {exc}")
 
-    for _, _, _, _, sockaddr in addrinfo:
-        ip = sockaddr[0]
-        if not is_safe_ip(ip):
-            raise SSRFViolationError(f"Host {hostname} resolved to forbidden IP {ip}")
+
+def validate_url_safe(url: str) -> None:
+    """Validate scheme + resolve/validate the host (no rebinding)."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise SSRFViolationError(
+            f"Protocol {parsed.scheme!r} is not allowed. Only HTTP/HTTPS."
+        )
+    if not parsed.hostname:
+        raise SSRFViolationError("URL missing hostname.")
+    default_port = 443 if parsed.scheme == "https" else 80
+    _resolve_and_validate(parsed.hostname, parsed.port or default_port)
 
 
 def safe_download(
@@ -66,53 +154,42 @@ def safe_download(
     max_redirects: int = 5,
     max_bytes: int = 20 * 1024 * 1024,
     timeout: float = 10.0,
-) -> tuple[bytes, str]:
+) -> Tuple[bytes, str]:
     """
-    Securely downloads an image.
-    - Manually handles redirects to validate each step against SSRF.
-    - Limits total bytes downloaded to prevent RAM DOS.
-    - Ignores Content-Length.
+    Securely download an image.
+      - Each hop is validated AND pinned to a validated IP (anti-rebinding).
+      - Redirects are followed manually so every hop is re-checked.
+      - Total bytes are capped while streaming (anti-DOS); Content-Length ignored.
     Returns (content_bytes, content_type).
     """
     current_url = url
-    session = requests.Session()
-    
+
     for attempt in range(max_redirects + 1):
-        validate_url_safe(current_url)
-        
+        resp = _pinned_get(current_url, timeout=timeout)
         try:
-            # We don't allow automatic redirects to prevent blind SSRF chains
-            resp = session.get(current_url, stream=True, allow_redirects=False, timeout=timeout)
-        except RequestException as e:
-            raise SSRFViolationError(f"Request failed: {e}")
+            if 300 <= resp.status_code < 400:
+                if attempt == max_redirects:
+                    raise SSRFViolationError("Too many redirects.")
+                location = resp.headers.get("Location")
+                if not location:
+                    raise SSRFViolationError("Redirect missing Location header.")
+                current_url = urllib.parse.urljoin(current_url, location)
+                continue
 
-        if 300 <= resp.status_code < 400:
-            if attempt == max_redirects:
-                raise SSRFViolationError("Too many redirects.")
-            location = resp.headers.get("Location")
-            if not location:
-                raise SSRFViolationError("Redirect missing Location header.")
-            # Resolve relative redirects
-            current_url = urllib.parse.urljoin(current_url, location)
-            resp.close()
-            continue
+            resp.raise_for_status()
 
-        resp.raise_for_status()
-
-        # Streaming download to enforce max_bytes
-        downloaded = bytearray()
-        content_type = resp.headers.get("Content-Type", "")
-        
-        try:
+            content_type = resp.headers.get("Content-Type", "")
+            downloaded = bytearray()
             for chunk in resp.iter_content(chunk_size=16384):
-                if chunk:
-                    downloaded.extend(chunk)
-                    if len(downloaded) > max_bytes:
-                        resp.close()
-                        raise DownloadLimitExceededError(f"File exceeds maximum size of {max_bytes} bytes.")
+                if not chunk:
+                    continue
+                downloaded.extend(chunk)
+                if len(downloaded) > max_bytes:
+                    raise DownloadLimitExceededError(
+                        f"File exceeds maximum size of {max_bytes} bytes."
+                    )
+            return bytes(downloaded), content_type
         finally:
             resp.close()
-
-        return bytes(downloaded), content_type
 
     raise SSRFViolationError("Download failed after redirects.")

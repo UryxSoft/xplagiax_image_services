@@ -203,6 +203,82 @@ class UsageTracker:
 
 
 # ---------------------------------------------------------------------------
+# Reverse-image result normalisation + verdict
+# ---------------------------------------------------------------------------
+
+def _extract_matches(provider: str, engine: str, raw: dict) -> list[dict]:
+    """Map heterogeneous provider payloads to a uniform match list."""
+    matches: list[dict] = []
+    candidate_lists = []
+    if provider == "serpapi":
+        # google_lens → visual_matches; google_reverse_image → image_results.
+        candidate_lists = [
+            raw.get("visual_matches"),
+            raw.get("image_results"),
+            raw.get("inline_images"),
+        ]
+    elif provider == "zenserp":
+        candidate_lists = [
+            raw.get("reverse_image_results"),
+            raw.get("image_results"),
+            raw.get("visual_matches"),
+        ]
+    for lst in candidate_lists:
+        if isinstance(lst, list) and lst:
+            for r in lst:
+                if not isinstance(r, dict):
+                    continue
+                matches.append({
+                    "title":     r.get("title") or r.get("source") or "",
+                    "link":      r.get("link") or r.get("url") or r.get("source_url") or "",
+                    "source":    r.get("source") or r.get("displayed_link") or "",
+                    "thumbnail": r.get("thumbnail") or r.get("image") or r.get("original") or "",
+                })
+            break  # use the first non-empty list only
+    return matches
+
+
+def normalize_reverse_results(
+    provider: str, engine: str, raw: dict, query_image_url: str, num_results: int
+) -> dict:
+    """
+    Produce a provider-agnostic reverse-image result with an explicit,
+    PROBABILISTIC verdict about whether the image appears online.
+
+    NOTE: reverse image search can never prove an image is/ isn't on the
+    internet — absence of matches is not proof of absence. Treat as a signal.
+    """
+    raw = raw or {}
+    matches = _extract_matches(provider, engine, raw)[:num_results]
+    count = len(matches)
+
+    if count == 0:
+        verdict, confidence = "NOT_FOUND", 0.05
+    elif count <= 2:
+        verdict, confidence = "POSSIBLE_PARTIAL_MATCH", 0.5
+    elif count < 10:
+        verdict, confidence = "LIKELY_PRESENT_ONLINE", 0.8
+    else:
+        verdict, confidence = "LIKELY_PRESENT_ONLINE", 0.9
+
+    return {
+        "found_on_internet": count > 0,
+        "verdict": verdict,
+        "confidence": confidence,
+        "match_count": count,
+        "matches": matches,
+        "provider": provider,
+        "engine": engine,
+        "query_image_url": query_image_url,
+        "disclaimer": (
+            "Reverse image search is probabilistic: matches indicate a similar "
+            "image is indexed by the provider; absence of matches does NOT prove "
+            "the image is not online."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main rotator
 # ---------------------------------------------------------------------------
 
@@ -219,13 +295,29 @@ class SmartApiRotator:
         request_timeout_s: float = 15.0,
         max_retries: int = 3,
         health_check_interval: int = 300,
+        reverse_engine: str = "google_lens",
+        redis_client=None,
+        circuit_failure_threshold: int = 5,
+        circuit_recovery_s: int = 120,
     ) -> None:
         self._providers = {p.name: p for p in providers}
         self._usage = usage_tracker
         self._timeout = request_timeout_s
         self._max_retries = max_retries
+        self._reverse_engine = reverse_engine
         self._scores: dict[str, ProviderScore] = {
             p.name: ProviderScore(name=p.name) for p in providers
+        }
+        # Cross-worker circuit breakers (Redis-backed). Degrade gracefully if no Redis.
+        from app.services.circuit_breaker import CircuitBreaker
+        self._breakers = {
+            p.name: CircuitBreaker(
+                redis_client=redis_client,
+                name=f"apirotator:{p.name}",
+                failure_threshold=circuit_failure_threshold,
+                recovery_timeout_secs=circuit_recovery_s,
+            )
+            for p in providers
         }
         self._start_health_checker(health_check_interval)
 
@@ -239,6 +331,10 @@ class SmartApiRotator:
         for name, cfg in self._providers.items():
             score_obj = self._scores[name]
             if score_obj.is_penalised:
+                continue
+            # Skip providers whose distributed circuit breaker is OPEN.
+            if not self._breakers[name].is_allowed():
+                logger.warning("api_provider_circuit_open", provider=name)
                 continue
             used = self._usage.get_count(name)
             limit = cfg.monthly_limit
@@ -323,32 +419,41 @@ class SmartApiRotator:
         )
         return response.json()
 
-    def _execute_with_fallback(self, build_params: Callable[[str], tuple[str, dict]]) -> dict:
+    def _execute_with_fallback(
+        self, build_params: Callable[[str], tuple[str, dict]]
+    ) -> tuple[str, dict]:
         """
         Try providers in score order. On failure, try next provider.
         `build_params(provider_name)` returns (url, params) for that provider.
+        Returns (provider_name, raw_json) so callers can normalise per provider.
         """
         ordered = self._available_providers()
         last_exc: Optional[Exception] = None
 
+        # Retry policy defined ONCE (not rebuilt per iteration).
+        retry_policy = retry(
+            stop=stop_after_attempt(self._max_retries),
+            wait=wait_exponential(multiplier=1, min=1, max=10),
+            retry=retry_if_exception_type((Timeout, ConnectionError, ProviderServerError)),
+            reraise=True,
+        )
+
+        def _attempt(provider_name: str):
+            url, params = build_params(provider_name)
+            return self._execute(provider_name, url, params)
+
         for provider_name in ordered:
-
-            @retry(
-                stop=stop_after_attempt(self._max_retries),
-                wait=wait_exponential(multiplier=1, min=1, max=10),
-                retry=retry_if_exception_type((Timeout, ConnectionError, ProviderServerError)),
-                reraise=True,
-            )
-            def attempt():
-                url, params = build_params(provider_name)
-                return self._execute(provider_name, url, params)
-
+            breaker = self._breakers[provider_name]
             try:
-                return attempt()
+                result = retry_policy(_attempt)(provider_name)
+                breaker.record_success()
+                return provider_name, result
             except ProviderRateLimitError:
+                breaker.record_failure()
                 last_exc = None  # already penalised, try next
                 continue
             except Exception as exc:
+                breaker.record_failure()
                 last_exc = exc
                 logger.warning(
                     "api_provider_failed_trying_next",
@@ -364,30 +469,37 @@ class SmartApiRotator:
     # ------------------------------------------------------------------
 
     def reverse_image_search(self, image_url: str, num_results: int = 10) -> dict:
+        """
+        Determine whether an image appears elsewhere on the internet.
+
+        Uses Google Lens (best available reverse-image method) via SerpApi by
+        default; falls back to google_reverse_image or Zenserp. Returns a
+        NORMALISED, provider-agnostic result with an explicit verdict.
+        """
+        engine = self._reverse_engine
+
         def build(provider: str) -> tuple[str, dict]:
             if provider == "serpapi":
-                return (
-                    "https://serpapi.com/search.json",
-                    {
-                        "engine": "google_reverse_image",
-                        "image_url": image_url,
-                        "api_key": self._providers[provider].api_key,
-                        "num": num_results,
-                    },
-                )
+                params = {
+                    "engine": engine,
+                    "api_key": self._providers[provider].api_key,
+                }
+                # google_lens uses `url`; google_reverse_image uses `image_url`.
+                params["url" if engine == "google_lens" else "image_url"] = image_url
+                return ("https://serpapi.com/search.json", params)
             elif provider == "zenserp":
                 return (
                     "https://app.zenserp.com/api/v2/search",
                     {
                         "apikey": self._providers[provider].api_key,
-                        "q": "*",
                         "image_url": image_url,
-                        "num": num_results,
+                        "search_engine": "images.google.com",
                     },
                 )
             raise ValueError(f"Unknown provider: {provider}")
 
-        return self._execute_with_fallback(build)
+        provider, raw = self._execute_with_fallback(build)
+        return normalize_reverse_results(provider, engine, raw, image_url, num_results)
 
     def patent_text_search(self, query: str, num_results: int = 10) -> dict:
         def build(provider: str) -> tuple[str, dict]:
@@ -413,7 +525,8 @@ class SmartApiRotator:
                 )
             raise ValueError(f"Unknown provider: {provider}")
 
-        return self._execute_with_fallback(build)
+        _provider, raw = self._execute_with_fallback(build)
+        return raw
 
     def patent_image_search(self, image_url: str, num_results: int = 10) -> dict:
         """
@@ -422,8 +535,7 @@ class SmartApiRotator:
         """
         reverse = self.reverse_image_search(image_url, num_results=3)
         keywords = " ".join(
-            r.get("title", "")
-            for r in (reverse.get("image_results") or [])[:3]
+            m.get("title", "") for m in (reverse.get("matches") or [])[:3]
         ).strip()
 
         if not keywords:
@@ -446,7 +558,8 @@ class SmartApiRotator:
                 )
             raise ValueError(f"Patent details not supported by provider: {provider}")
 
-        return self._execute_with_fallback(build)
+        _provider, raw = self._execute_with_fallback(build)
+        return raw
 
     def get_usage_status(self) -> dict:
         status = {}

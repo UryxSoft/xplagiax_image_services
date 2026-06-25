@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import io
 from typing import Optional
+from urllib.parse import urlparse
 
 from flask import Blueprint, current_app, g, jsonify, request, send_file
 
 from app.observability.telemetry import get_logger
-from app.security.middleware import rate_limit, require_auth
+from app.security.middleware import rate_limit, require_admin, require_auth
 from app.utils.image_validation import (
     ImageValidationError,
     sanitise_filename,
@@ -57,6 +59,30 @@ def _svc(name: str):
     return current_app.extensions[f"xplagiax_{name}"]
 
 
+def _warn_if_unreachable(url: str) -> None:
+    """
+    Reverse-image providers fetch the image URL from the public internet.
+    If we hand them a localhost/internal URL the search silently returns nothing,
+    so surface a clear warning at runtime (config fix: set SEAWEEDFS_PUBLIC_URL).
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return
+    internal = (
+        host in ("localhost", "127.0.0.1", "::1", "")
+        or host.endswith(".local")
+        or host.endswith(".internal")
+        or host.startswith(("10.", "192.168.", "172."))
+    )
+    if internal:
+        logger.warning(
+            "reverse_search_url_not_public",
+            host=host,
+            hint="Provider cannot fetch internal URLs. Set SEAWEEDFS_PUBLIC_URL to a public host.",
+        )
+
+
 def _get_request_params() -> dict:
     """Extract parameters from JSON or Form Data safely."""
     if request.is_json:
@@ -85,13 +111,15 @@ def _parse_image_upload(required: bool = True, params: Optional[dict] = None):
             file_upload=file_upload,
             image_url=image_url,
             image_path=image_path,
-            max_bytes=cfg.max_image_bytes
+            max_bytes=cfg.max_image_bytes,
+            allow_local_path=cfg.allow_local_image_path,
         )
 
         pil_image, mime_type = validate_and_load(
             image_bytes,
             max_bytes=cfg.max_image_bytes,
             allowed_mimes=cfg.allowed_mime_types,
+            max_pixels=cfg.max_image_pixels,
         )
         filename = sanitise_filename(raw_filename)
         return image_bytes, pil_image, filename, None, None
@@ -145,6 +173,7 @@ def upload_and_index():
             page=page,
             run_ai_detection=run_ai,
             extra_metadata=extra,
+            request_id=g.request_id,
         )
     except Exception as exc:
         logger.error("upload_failed", error=str(exc), exc_info=True)
@@ -207,9 +236,15 @@ def upload_batch():
                 file_upload=file_upload,
                 image_url=url,
                 image_path=path,
-                max_bytes=cfg.max_image_bytes
+                max_bytes=cfg.max_image_bytes,
+                allow_local_path=cfg.allow_local_image_path,
             )
-            pil_image, _ = validate_and_load(image_bytes, max_bytes=cfg.max_image_bytes)
+            pil_image, _ = validate_and_load(
+                image_bytes,
+                max_bytes=cfg.max_image_bytes,
+                allowed_mimes=cfg.allowed_mime_types,
+                max_pixels=cfg.max_image_pixels,
+            )
             filename = sanitise_filename(fetch_name)
             result = indexing.submit(
                 image_bytes=image_bytes,
@@ -273,7 +308,7 @@ def get_image(point_id: str):
         image_bytes = storage.load(storage_key)
         mime = payload.get("mime_type", "jpeg")
         return send_file(
-            __import__("io").BytesIO(image_bytes),
+            io.BytesIO(image_bytes),
             mimetype=f"image/{mime}",
             as_attachment=False,
         )
@@ -477,15 +512,22 @@ def analyze_ai_detection():
 
         result = models.classify_single(pil_image)
         return jsonify({
-            "is_ai":        result.is_ai,
-            "is_human":     result.is_human,
-            "label":        result.label,
-            "confidence":   round(result.confidence, 6),
-            "ai_score":     result.ai_score,
-            "human_score":  result.human_score,
-            "all_scores":   result.all_scores,
-            "model_id":     result.model_id,
-            "duration_ms":  round(result.duration_ms, 1),
+            "is_ai":            result.is_ai,
+            "is_human":         result.is_human,
+            "is_uncertain":     result.is_uncertain,
+            "label":            result.label,
+            "confidence":       round(result.confidence, 6),
+            "confidence_bucket": result.confidence_bucket,
+            "ai_score":         result.ai_score,
+            "human_score":      result.human_score,
+            "all_scores":       result.all_scores,
+            "model_id":         result.model_id,
+            "duration_ms":      round(result.duration_ms, 1),
+            "disclaimer": (
+                "AI-detection is probabilistic and degrades on compressed, "
+                "cropped, screenshotted or out-of-distribution images. Do not "
+                "treat as definitive proof."
+            ),
         }), 200
     except Exception as exc:
         logger.error("ai_detection_failed", error=str(exc), exc_info=True)
@@ -530,12 +572,12 @@ def patent_search_by_image():
                 return jsonify(err), code
             
             storage = _svc("storage")
-            import hashlib
             content_hash = hashlib.sha256(raw).hexdigest()
             fmt = (pil_image.format or "jpeg").lower()
-            
+
             storage_key = storage.save(raw, content_hash, "temp_search", filename, fmt)
             image_url = storage.get_url(storage_key, expiry_seconds=3600)
+            _warn_if_unreachable(image_url)
 
             # Explicitly free memory for large variables
             del raw, pil_image
@@ -620,12 +662,12 @@ def reverse_image_search():
                 return jsonify(err), code
             
             storage = _svc("storage")
-            import hashlib
             content_hash = hashlib.sha256(raw).hexdigest()
             fmt = (pil_image.format or "jpeg").lower()
-            
+
             storage_key = storage.save(raw, content_hash, "temp_search", filename, fmt)
             image_url = storage.get_url(storage_key, expiry_seconds=3600)
+            _warn_if_unreachable(image_url)
 
             # Explicitly free memory for large variables
             del raw, pil_image
@@ -669,7 +711,7 @@ RESET_CONFIRMATION_TOKEN = "I_UNDERSTAND_THIS_WILL_DELETE_ALL_DATA"
 
 
 @admin_bp.route("/collection/reset", methods=["DELETE"])
-@require_auth
+@require_admin
 def reset_collection():
     """
     Drop and recreate the entire Qdrant collection.
@@ -693,7 +735,7 @@ def reset_collection():
 
 
 @admin_bp.route("/collection/groups/<group_id>", methods=["DELETE"])
-@require_auth
+@require_admin
 def delete_group(group_id: str):
     safe_group_id = sanitise_group_id(group_id)
     try:
@@ -767,45 +809,32 @@ def readiness():
     """
     Readiness probe — is the service ready to handle traffic?
     Returns 200 only when Qdrant + CLIP are operational.
+    Intentionally returns ONLY booleans — no error strings or internal URLs
+    (those are an information-disclosure risk on an unauthenticated probe).
     """
-    checks = {}
-    overall_ok = True
-
-    # Qdrant
     repo = _svc("repo")
-    qdrant_health = repo.health_check()
-    checks["qdrant"] = qdrant_health
-    if qdrant_health["status"] != "ok":
-        overall_ok = False
-
-    # CLIP (required)
     models = _svc("models")
-    model_status = models.get_status()
-    checks["clip"] = {
-        "loaded": model_status["clip"]["loaded"],
-        "error":  model_status["clip"]["error"],
-    }
-    if not model_status["clip"]["loaded"]:
-        overall_ok = False
-
-    # SigLIP (optional — degraded if down, not unhealthy)
-    checks["siglip"] = {
-        "loaded":  model_status["siglip"]["loaded"],
-        "error":   model_status["siglip"]["error"],
-        "degraded": not model_status["siglip"]["loaded"],
-    }
-
-    # Redis (optional)
     cache = _svc("cache")
-    checks["redis"] = cache.health_check()
+    model_status = models.get_status()
+
+    qdrant_ok = repo.health_check().get("status") == "ok"
+    clip_ok = bool(model_status["clip"]["loaded"])
+    siglip_ok = bool(model_status["siglip"]["loaded"])
+    overall_ok = qdrant_ok and clip_ok
 
     return jsonify({
         "status": "ready" if overall_ok else "not_ready",
-        "checks": checks,
+        "checks": {
+            "qdrant": qdrant_ok,
+            "clip": clip_ok,
+            "siglip": siglip_ok,          # optional → does not block readiness
+            "redis": cache.available,
+        },
     }), 200 if overall_ok else 503
 
 
 @health_bp.route("/health", methods=["GET"])
+@require_auth
 def health_detailed():
     """Detailed health — includes collection stats, model metadata, storage status."""
     repo = _svc("repo")

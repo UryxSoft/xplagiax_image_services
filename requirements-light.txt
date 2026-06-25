@@ -26,6 +26,8 @@ imagehash==4.3.1
 
 # Quantización INT8 para CPU (incluida en torch, pero optimum la expone mejor)
 optimum==1.21.2
+# Carga con low_cpu_mem_usage=True → menor pico de RAM al cargar modelos
+accelerate==0.33.0
 
 # Vector DB
 qdrant-client==1.10.1

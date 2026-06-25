@@ -358,11 +358,16 @@ class TestApiRoutes(unittest.TestCase):
             ),
             security=SecurityConfig(
                 api_key="test-api-key-1234",
+                admin_api_key="test-admin-key-1234",
                 require_auth=True,
                 max_image_bytes=5 * 1024 * 1024,
+                max_image_pixels=40_000_000,
                 allowed_mime_types=frozenset({"jpeg", "png", "webp"}),
                 rate_limit_per_minute=1000,
                 rate_limit_per_hour=10000,
+                trusted_proxies=("127.0.0.1",),
+                trusted_proxy_count=1,
+                allow_local_image_path=False,
             ),
             storage=StorageConfig(
                 image_backend="local", local_base_path="/tmp/test_images",
@@ -493,11 +498,20 @@ class TestApiRoutes(unittest.TestCase):
         resp = self.client.delete(
             "/api/v1/admin/collection/reset",
             json={},
-            headers=self.headers,
+            headers={"X-Admin-Key": "test-admin-key-1234"},
         )
         self.assertEqual(resp.status_code, 400)
         data = resp.get_json()
         self.assertEqual(data["code"], "CONFIRMATION_REQUIRED")
+
+    def test_reset_with_service_key_only_is_forbidden(self):
+        """Destructive admin op must reject the plain service key."""
+        resp = self.client.delete(
+            "/api/v1/admin/collection/reset",
+            json={"confirm": "I_UNDERSTAND_THIS_WILL_DELETE_ALL_DATA"},
+            headers=self.headers,  # service key, not admin key
+        )
+        self.assertEqual(resp.status_code, 403)
 
     # -- Error format --
 
@@ -599,6 +613,110 @@ class TestLocalImageStorage(unittest.TestCase):
         import os
         full_path = os.path.join(self.tmpdir, key)
         self.assertTrue(os.path.abspath(full_path).startswith(os.path.abspath(self.tmpdir)))
+
+
+# ===========================================================================
+# TestLabelSemantics — robust AI/human label resolution
+# ===========================================================================
+
+class TestLabelSemantics(unittest.TestCase):
+
+    def test_ai_hum_labels(self):
+        from app.models.labels import resolve_label_semantics
+        m = resolve_label_semantics({0: "ai", 1: "hum"})
+        self.assertEqual(m, {0: "ai", 1: "human"})
+
+    def test_human_artificial_labels(self):
+        from app.models.labels import resolve_label_semantics
+        m = resolve_label_semantics({0: "human", 1: "artificial"})
+        self.assertEqual(m[0], "human")
+        self.assertEqual(m[1], "ai")
+
+    def test_real_fake_labels(self):
+        from app.models.labels import resolve_label_semantics
+        m = resolve_label_semantics({0: "REAL", 1: "FAKE"})
+        self.assertEqual(m[0], "human")
+        self.assertEqual(m[1], "ai")
+
+    def test_unknown_labels_raise(self):
+        from app.models.labels import resolve_label_semantics
+        with self.assertRaises(ValueError):
+            resolve_label_semantics({0: "cat", 1: "dog"})
+
+    def test_must_cover_both_classes(self):
+        from app.models.labels import resolve_label_semantics
+        with self.assertRaises(ValueError):
+            resolve_label_semantics({0: "ai", 1: "generated"})
+
+    def test_override_by_index_for_opaque_labels(self):
+        from app.models.labels import resolve_label_semantics
+        m = resolve_label_semantics({0: "LABEL_0", 1: "LABEL_1"},
+                                    override={"0": "human", "1": "ai"})
+        self.assertEqual(m, {0: "human", 1: "ai"})
+
+    def test_override_by_label_string(self):
+        from app.models.labels import resolve_label_semantics
+        m = resolve_label_semantics({0: "class_a", 1: "class_b"},
+                                    override={"class_a": "ai", "class_b": "human"})
+        self.assertEqual(m[0], "ai")
+        self.assertEqual(m[1], "human")
+
+    def test_override_invalid_value_raises(self):
+        from app.models.labels import resolve_label_semantics
+        with self.assertRaises(ValueError):
+            resolve_label_semantics({0: "x", 1: "y"}, override={"0": "robot", "1": "human"})
+
+
+# ===========================================================================
+# TestReverseNormalization — provider-agnostic reverse-image verdict
+# ===========================================================================
+
+class TestReverseNormalization(unittest.TestCase):
+
+    def test_serpapi_google_lens_matches(self):
+        from app.services.api_rotator import normalize_reverse_results
+        raw = {"visual_matches": [
+            {"title": "A", "link": "http://a", "source": "a.com", "thumbnail": "t"},
+            {"title": "B", "link": "http://b", "source": "b.com", "thumbnail": "t"},
+            {"title": "C", "link": "http://c", "source": "c.com", "thumbnail": "t"},
+        ]}
+        out = normalize_reverse_results("serpapi", "google_lens", raw, "http://img", 10)
+        self.assertTrue(out["found_on_internet"])
+        self.assertEqual(out["match_count"], 3)
+        self.assertEqual(out["verdict"], "LIKELY_PRESENT_ONLINE")
+        self.assertEqual(out["matches"][0]["link"], "http://a")
+
+    def test_no_matches_not_found(self):
+        from app.services.api_rotator import normalize_reverse_results
+        out = normalize_reverse_results("serpapi", "google_lens", {}, "http://img", 10)
+        self.assertFalse(out["found_on_internet"])
+        self.assertEqual(out["verdict"], "NOT_FOUND")
+
+    def test_num_results_truncation(self):
+        from app.services.api_rotator import normalize_reverse_results
+        raw = {"image_results": [{"title": str(i), "link": f"http://{i}"} for i in range(20)]}
+        out = normalize_reverse_results("serpapi", "google_reverse_image", raw, "u", 5)
+        self.assertEqual(out["match_count"], 5)
+
+
+# ===========================================================================
+# TestSSRFGuards — IP safety classification
+# ===========================================================================
+
+class TestSSRFGuards(unittest.TestCase):
+
+    def test_public_ip_is_safe(self):
+        from app.security.http_client import is_safe_ip
+        self.assertTrue(is_safe_ip("8.8.8.8"))
+
+    def test_private_and_metadata_blocked(self):
+        from app.security.http_client import is_safe_ip
+        for ip in ("127.0.0.1", "10.0.0.5", "192.168.1.1", "169.254.169.254", "0.0.0.0", "::1"):
+            self.assertFalse(is_safe_ip(ip), ip)
+
+    def test_garbage_is_unsafe(self):
+        from app.security.http_client import is_safe_ip
+        self.assertFalse(is_safe_ip("not-an-ip"))
 
 
 # ===========================================================================

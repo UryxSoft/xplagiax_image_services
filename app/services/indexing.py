@@ -119,6 +119,7 @@ class IndexingService:
         page: Optional[int] = None,
         run_ai_detection: bool = True,
         extra_metadata: Optional[dict] = None,
+        request_id: Optional[str] = None,
     ) -> dict:
         """
         Submit an image for indexing.
@@ -169,6 +170,7 @@ class IndexingService:
                 page=page,
                 run_ai_detection=run_ai_detection,
                 extra_metadata=extra_metadata or {},
+                request_id=request_id,
             )
         else:
             return self._process_sync(

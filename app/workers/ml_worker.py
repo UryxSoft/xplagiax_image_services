@@ -104,6 +104,11 @@ def _init_worker():
         clip_model_id=cfg.model.clip_model_id,
         device=cfg.model.device,
         max_batch_size=cfg.model.max_batch_size,
+        ai_confidence_high=cfg.model.ai_confidence_high,
+        ai_confidence_med=cfg.model.ai_confidence_med,
+        ai_temperature=cfg.model.ai_temperature,
+        max_concurrency=cfg.model.inference_max_concurrency,
+        ai_label_map=cfg.model.ai_label_map,
     )
     _models.load_all()  # Synchronous in worker — no background thread needed
 
@@ -132,6 +137,7 @@ def process_index_job(
     page: Optional[int] = None,
     run_ai_detection: bool = True,
     extra_metadata: Optional[dict] = None,
+    request_id: Optional[str] = None,
     **kwargs,
 ) -> dict:
     """
@@ -142,6 +148,12 @@ def process_index_job(
     """
     _init_worker()
     start = time.perf_counter()
+
+    # Bind the originating request id so worker logs correlate with API logs.
+    import structlog
+    structlog.contextvars.bind_contextvars(
+        request_id=request_id or job_id, job_id=job_id,
+    )
 
     _cache.update_job(job_id, {"status": "processing", "started_at": time.time()})
 

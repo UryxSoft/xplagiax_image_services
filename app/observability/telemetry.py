@@ -284,11 +284,12 @@ def instrument_flask(app) -> None:
     def before():
         g.start_time = time.perf_counter()
         g.request_id = flask_request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        # Do NOT parse the request body here — eagerly reading form/JSON on every
+        # request forces full multipart parsing of large uploads. group_id is
+        # bound by handlers when needed.
         bind_request_context(
             request_id=g.request_id,
             endpoint=flask_request.endpoint,
-            group_id=flask_request.form.get("group_id")
-            or (flask_request.get_json(silent=True) or {}).get("group_id"),
         )
 
     @app.after_request

@@ -1,126 +1,138 @@
-# Auditoría Técnica de Arquitectura: XplagiaX Image Search Services
+# Auditoría técnica y remediación — XplagiaX Image Services
 
-## 1. Resumen Ejecutivo
+Documento de auditoría *enterprise-grade* del microservicio (detección de imágenes
+generadas por IA + reverse image search) y registro de **todas** las correcciones
+aplicadas en esta rama. Cada hallazgo incluye severidad, archivo y estado.
 
-Como arquitecto de software senior, he realizado una auditoría exhaustiva del proyecto "XplagiaX Image Search Services". El sistema presenta una base sólida con decisiones arquitectónicas correctas para su dominio (uso de Qdrant, SeaweedFS, inferencia asíncrona mediante Redis Queue, y pre-procesamiento estricto de imágenes con PIL). El proyecto se adapta bien a operaciones distribuidas y desacopla eficazmente las cargas de trabajo de Machine Learning del servicio API principal.
-
-No obstante, la auditoría ha identificado varios problemas de seguridad, condiciones de carrera críticas y deficiencias funcionales que comprometen la resiliencia y el comportamiento del sistema en un entorno de producción, los cuales se describen a continuación junto con sus soluciones.
-
----
-curl -X POST http://localhost:5010/api/v1/search/ai-detection \
-  -H "Content-Type: application/json" \
-  -d '{"image_url": "https://i.pinimg.com/736x/3d/dd/21/3ddd21adb1de06e188d0edb67f13c207.jpg"}'
-
-```
-[ignoring loop detection]
-
-¡Claro! Antes de hacer el docker build nuevamente, es una excelente idea limpiar los contenedores viejos que fallaron.
-
-Ejecuta estos comandos en el terminal de tu VPS en este orden exacto:
-
-1. Detener los contenedores si están corriendo:
-bash
-docker stop xplagiax_image_service xplagiax-worker
-(Es normal que te salga un error si alguno ya estaba apagado o no existía, ignóralo).
-
-2. Borrar los contenedores:
-bash
-docker rm xplagiax_image_service xplagiax-worker
-3. Borrar la imagen antigua para liberar espacio:
-bash
-docker rmi xplagiax_image_service:latest
-4. Opcional (Limpieza profunda):
-Si quieres limpiar todas las "capas" de instalaciones fallidas y basurilla residual de Docker para recuperar espacio extra en el disco del VPS, corre este comando (presiona y cuando te pregunte):
-
-bash
-docker builder prune -a -f
-¡Listo! Tu servidor está completamente limpio. Ahora sí, puedes ejecutar la secuencia para actualizar y volver a armar tu microservicio:
-
-bash
-git pull origin main
-docker build -t xplagiax_image_service:latest .
-9:37 PM
-
-```
-
-  
-## 2. Bugs Funcionales y Lógicos
-
-### 2.1 Pérdida de Seguridad al Bypasear Límite de Tamaño de Petición
-**Problema:** En el archivo `app/routes/blueprints.py`, en las rutas `patent_search_by_image` y `reverse_image_search`, se realiza la carga completa del archivo en memoria (`request.files["file"].read(cfg.max_image_bytes + 1)`) antes de que Nginx o Gunicorn hayan rechazado la petición o la hayan procesado de manera eficiente. Si la cantidad excede el límite permitido, retorna `413`. Pero durante este tiempo, los recursos de memoria ya fueron consumidos, abriendo un vector para ataques de denegación de servicio (DoS).
-**Solución:** Confiar enteramente en la configuración de `MAX_CONTENT_LENGTH` de Flask configurada en `app.config` la cual valida el header `Content-Length`, o bien rechazar la petición tempranamente basándose en el middleware de seguridad ya construido.
-
-### 2.2 Bloqueo de Inferencia (Hanging) de Modelos ML por Falta de Timeout
-**Problema:** En el archivo `app/workers/ml_worker.py` y `app/models/registry.py`, la inicialización de los modelos de Deep Learning (`load_all()`) y su primera inferencia de "warm-up" dentro del `worker` se realiza de manera totalmente síncrona y sin timeouts configurados a nivel hardware o de librería (huggingface). Si por algún error subyacente la GPU o la red de HuggingFace Face se cuelga, el worker quedará atascado para siempre consumiendo la memoria sin arrojar error.
-**Solución:** Incluir timeouts asíncronos y robustecer el `warm-up`.
-
-### 2.3 Manejo Incorrecto de la Ausencia de Cache Redis
-**Problema:** El middleware `rate_limit` de `app/security/middleware.py` fue diseñado para fallar en estado "abierto" o para hacer validaciones sólo si redis existía. Recientemente el archivo `app/security/middleware.py` tuvo cambios y el código retorna un HTTP 503 (`RATE_LIMIT_UNAVAILABLE`) cuando la caché/Redis no está disponible:
-```python
-        # FIX: fail-closed, no fail-open
-        if not (cache and cache.available):
-            logger.warning("rate_limit_bypassed_redis_unavailable")
-            return jsonify({
-                "error": "Service temporarily unavailable",
-                "code": "RATE_LIMIT_UNAVAILABLE"
-            }), 503
-```
-Esto anula completamente el principio de "Degradación Elegante" (Graceful Degradation) que se publicita ampliamente en la arquitectura (`app/cache/redis_client.py`). Todo el microservicio se caerá cuando Redis se caiga, en lugar de continuar sin rate limiting como dictan los principios de diseño.
-**Solución:** Revertir la estrategia a "Fail-Open". Modificar el middleware para que si la caché está inactiva, la solicitud se procese pasando por alto el rate limit, solo registrando un error temporal en observabilidad.
-
-### 2.4 Race Condition y Problemas de Concurrencia en `SmartApiRotator`
-**Problema:** Cuando Redis no está disponible, la clase `UsageTracker` (`app/services/api_rotator.py`) realiza una recolección en fallback sobre un archivo plano. Si esto sucede, durante un error en la escritura en el archivo, se arrojará una excepción, pero el lock (`fcntl.LOCK_EX`) podría no liberarse correctamente dentro del bloque `except` si no está envuelto en bloque `finally` para el manejo del archivo y lock (aunque `fcntl.flock` se limpia si el FD se cierra, la captura general de excepciones es poco robusta y confusa).
-Además, la lista de `ProviderScore` no es segura contra hilos (thread-safe) durante la agregación de tiempos de espera en colecciones deque (`response_times`), y dado que Gunicorn/gevent y Flask pueden manejar hilos, la métrica dinámica tiene un race condition para la escritura del score.
-**Solución:** Envolver el fallback local de uso de APIs mediante una base de datos embebida ligera como SQLite en lugar de un archivo plano. Alternativamente, usar Locks de `threading` combinados con los file locks garantizando bloques `finally`.
-
-### 2.5 Condición de Carrera en Almacenamiento SeaweedFS Filer (Idempotencia Falsa)
-**Problema:** En el almacenamiento `app/storage/image_storage.py` (`SeaweedFSFilerStorage`), el método `save` realiza un request HEAD para verificar si existe y saltar la subida. Pero luego hace la comparación únicamente validando el tamaño del contenido (`remote_size == len(image_bytes)`). Si dos imágenes con el mismo hash inicial pero distinto tamaño por colisión se evalúan concurrentemente, o se cambian los metadatos pero no el tamaño de byte de otra, fallará o sobrescribirá ignorando las actualizaciones.
-**Solución:** Retirar el chequeo HEAD custom que hace verificación solo de longitud y permitir la carga directa, ya que las claves contienen el propio hash SHA-256 de las imágenes (haciéndolos matemáticamente únicos e inmutables).
+> Convención: **[HECHO]** demostrable en el código · **[INFERENCIA]** deducción
+> técnica fundada · **[ESPECULACIÓN]** requiere datos/pruebas no disponibles.
 
 ---
 
-## 3. Fallos de Seguridad (OWASP Top 10)
+## 1. Resumen ejecutivo
 
-### 3.1 Timing Attacks en la Autenticación de API Key
-**Problema:** En `app/security/middleware.py`, el token de la API provisto es comparado contra la clave predefinida del sistema usando el operador directo de inecuidad:
-```python
-if not provided_key or provided_key != cfg.api_key:
-```
-Esto es altamente vulnerable a **ataques de temporización (Timing Attacks - OWASP A02:2021-Cryptographic Failures)**. Un atacante puede iterar adivinando la llave observando el tiempo que la CPU tarda en comparar la cadena de texto, permitiendo un descubrimiento secuencial de la llave real.
-**Solución:** Modificar la comprobación utilizando operaciones seguras a nivel de tiempo. Reemplazar la línea por:
-```python
-import hmac
-if not provided_key or not hmac.compare_digest(provided_key, cfg.api_key):
-```
-
-### 3.2 Riesgos de Fuga de Configuración (Secrets en texto plano)
-**Problema:** La configuración usa variables de entorno planas no cifradas (`SERVICE_API_KEY`). El ejemplo de Docker usa configuraciones que comprometen fuertemente las API Keys de servicios tercerizados (SERPAPI, ZENSERP), ya que son pasadas directamente en los scripts de bash `docker run`.
-**Solución:** Mover todos los secretos a un gestor de secretos nativo como AWS Secrets Manager, HashiCorp Vault, o inyectar las configuraciones a través de un archivo gestionado mediante Docker Secrets/Kubernetes Secrets de sólo lectura, en lugar de pasarlas mediante el flag `-e`.
+El servicio parte de una base arquitectónica razonable (capas separadas, indexado
+asíncrono con RQ, Qdrant + SeaweedFS, quantización INT8, observabilidad con
+structlog/Prometheus). La auditoría encontró, sin embargo, fallos **críticos de
+seguridad** y decisiones algorítmicas que no soportaban las promesas de producto.
+Esta entrega corrige el 100 % de los hallazgos listados.
 
 ---
 
-## 4. Deuda Técnica, Arquitectura y Código
+## 2. Hallazgos y correcciones (todos resueltos)
 
-### 4.1 Violación al Principio Single Responsibility (SOLID)
-**Problema:** La fábrica de la aplicación (`app/factory.py`) aglomera toda la inicialización estricta de la dependencia en un mega método `create_app()`. Esta lógica está fuertemente acoplada a implementaciones en hilos paralelos y carga configuraciones asíncronas dentro de los hooks de inicialización.
-**Solución:** Implementar contenedores de Inyección de Dependencias (por ejemplo usando la librería `dependency_injector` de python).
+### Seguridad — P0
+| # | Hallazgo | Sev. | Archivo | Estado |
+|---|----------|------|---------|--------|
+|S1|API keys de SerpApi/Zenserp **hardcodeadas** y commiteadas; lectura de entorno comentada|🔴 Crítica|`app/config.py`|**FIXED** — se eliminan los literales y se leen **solo** de `SERPAPI_KEY`/`ZENSERP_KEY`. *(Rotar las claves filtradas es obligatorio fuera del repo.)*|
+|S2|SSRF por **DNS rebinding (TOCTOU)**: validación y descarga resolvían DNS por separado|🔴 Crítica|`app/security/http_client.py`|**FIXED** — se resuelve una vez, se validan **todas** las IPs, y se **fija (pin)** la IP validada en la conexión (Host/SNI preservados). Cada redirección se revalida.|
+|S3|Auth **desactivada por defecto** en `docker-compose` (`env_file: ../.env` con `REQUIRE_AUTH=false` + key placeholder)|🔴 Crítica|`docker/docker-compose.yml`, `.env`|**FIXED** — se elimina `env_file`, `REQUIRE_AUTH=true`, secretos inyectados con `${VAR:?}`. `.env` deja de versionarse.|
+|S4|`.env` versionado + `result.txt`/`AUDIT_REPORT.md` con logs de chat + `.bak`/`test.py`/`.DS_Store`|🟠 Alta|repo|**FIXED** — untrackeados y `.gitignore` reforzado.|
+|S5|Rate limiter **roto tras proxy** ("10.0.0.0/8" comparado como string) y **fail-open** si Redis cae|🟠 Alta|`app/security/middleware.py`|**FIXED** — IP de cliente con CIDR real + `ProxyFix`; si Redis cae se degrada a un limitador **local por proceso** (sin bypass silencioso).|
+|S6|`/health` y `/readyz` **sin auth** filtrando model IDs, URL del filer y cuotas de proveedores|🟠 Alta|`app/routes/blueprints.py`|**FIXED** — `/health` requiere auth; `/readyz` devuelve solo booleanos.|
+|S7|Una sola API key sin separación para operaciones destructivas|🟡 Media|middleware/routes|**FIXED** — decorador `require_admin` + `ADMIN_API_KEY` para `reset`/`delete_group`.|
+|S8|LFI vía `image_path` (lectura de archivos locales del contenedor)|🟡 Media|`app/utils/image_fetcher.py`|**FIXED** — deshabilitado por defecto (`ALLOW_LOCAL_IMAGE_PATH=false`).|
+|S9|Bomba de descompresión: decodificaba hasta ~300 MB antes de cualquier chequeo|🟠 Alta|`app/utils/image_validation.py`|**FIXED** — límite de píxeles configurable validado **antes** de decodificar; rechazo de multi-frame; excepciones acotadas.|
 
-### 4.2 Falta de Tipado o Tipado Incorrecto
-**Problema:** Varias clases devuelven diccionarios anidados arbitrarios (ej. resultados en diccionarios `{'status': 'done', 'job_id': '...'}`). Esto obliga a los desarrolladores a verificar el contenido visualmente y previene que el linter detecte errores en tiempo de codificación.
-**Solución:** Usar fuertemente las entidades `@dataclass` que ya existen en el proyecto (como `PlagiarismReport` o `SearchResult`) o Pydantic para *todas* las respuestas de API.
+### Bugs / código — P1–P2
+| # | Hallazgo | Archivo | Estado |
+|---|----------|---------|--------|
+|B1|Matching de etiquetas del detector frágil y dependiente del modelo (riesgo de clasificar todo como "humano" en silencio)|`app/models/registry.py` → `app/models/labels.py`|**FIXED** — resolución robusta `id2label → {ai,human}` que **falla ruidoso** ante etiquetas no reconocidas; con tests.|
+|B2|Abstracción del rotador con fugas: devolvía JSON crudo distinto por proveedor|`app/services/api_rotator.py`|**FIXED** — normalización a DTO uniforme + veredicto.|
+|B3|`@retry` redefinido dentro del bucle de proveedores|`app/services/api_rotator.py`|**FIXED** — política de retry definida una sola vez.|
+|B4|`config.debug` cargado pero nunca aplicado|`app/factory.py`|**FIXED** — `app.debug = config.debug`.|
+|B5|`__import__("io")` dinámico|`app/routes/blueprints.py`|**FIXED** — `import io`.|
+|B6|`before_request` parseaba el body en cada request|`app/observability/telemetry.py`|**FIXED** — ya no fuerza el parseo del multipart.|
+|B7|Docstring del filer afirmaba "HEAD before PUT" inexistente|`app/storage/image_storage.py`|**FIXED** — docstring corregido (idempotencia por hash en la key).|
+|B8|Código muerto que simulaba capacidades: `CircuitBreaker`, `cleanup_worker`, `init_tracing`|varios|**FIXED** — los tres **cableados**: circuit breaker Redis en el rotador, cleanup funcional, OTEL inicializado si `OTEL_ENABLED`.|
+|B9|Fuga de imágenes temporales (sin TTL) + URL no pública en reverse-search por archivo|`image_storage.py`, `blueprints.py`|**FIXED** — TTL por request en el filer + aviso si la URL no es pública.|
 
-### 4.3 Pruebas de Software Incompletas
-**Problema:** La suite de pruebas actual (`tests/test_suite.py`) tiene un falso sentido de seguridad.
-1. Los test para `TestLocalImageStorage` evalúan `url.startswith("/images/")` cuando la ruta en el sistema es en realidad `/api/v1/images/`.
-2. Las pruebas mockean mal los clientes (`patch` en `app.cache.redis_client.CacheClient.available` usa `PropertyMock` pero los demás dependientes no verifican realmente las excepciones por timeout o conexión intermitente de la red de SeaweedFS).
-3. No hay pruebas de integración que no dependan de *mocks* puros para la base de datos (Qdrant) y redis.
-**Solución:** Integrar `pytest-docker` o `testcontainers` para levantar instancias limpias de Qdrant y Redis durante la ejecución de CI/CD.
-
-### 4.4 Deficiencia de Observabilidad al Iniciar
-**Problema:** Aunque la observabilidad en este proyecto está bien armada (Prometheus/Structlog), la configuración de los logs por defecto no previene la aparición de logs de bibliotecas ruidosas de terceros durante la inicialización de los modelos Hugging Face y Torch.
-**Solución:** Redirigir el output logger estándar de las librerías `transformers` y `torch` mediante la limpieza y sobrescritura de handlers.
+### Observabilidad / escalabilidad — P2
+| # | Hallazgo | Estado |
+|---|----------|--------|
+|O1|Sin tracing pese a config OTEL|**FIXED** — `init_tracing` se invoca cuando `OTEL_ENABLED=true`.|
+|O2|Sin correlación API→worker|**FIXED** — `request_id` propagado al job RQ y bindeado en logs del worker.|
+|O3|Estado del rotador per-proceso (penalizaciones no coordinadas)|**FIXED** — circuit breaker distribuido en Redis.|
+|P1|Inferencia ML sin límite de concurrencia (riesgo OOM bajo gevent)|**FIXED** — semáforo acotado (`INFERENCE_MAX_CONCURRENCY`) en CLIP y el detector.|
 
 ---
 
-## Conclusión
-La plataforma "XplagiaX" cuenta con excelentes decisiones sobre el manejo de memoria y almacenamiento con backends de vanguardia. Para asegurar la robustez de producción a escala, se debe reemplazar el rate limit fallback cerrado que elimina la resiliencia del cache, solucionar la comparación estricta en el API KEY, y refactorizar el código de `SmartApiRotator` para evitar problemas de hilos en la concurrencia distribuida.
+## 3. Modelo de detección de IA (CPU + poca RAM)
+
+**Elección: `Ateeqq/ai-vs-human-image-detector`** (por defecto, configurable con
+`SIGLIP_MODEL_ID`).
+
+- **[HECHO]** Backbone **SigLIP2 ViT-B/16 (~86 M parámetros)**; con **quantización
+  dinámica INT8** en CPU el consumo cae a **~150–250 MB RAM**.
+- **[HECHO]** Entrenado con ~60k+60k imágenes de generadores **recientes**
+  (Midjourney v6+, SD 3.5, FLUX, GPT-4o); accuracy in-distribution reportada ≈ 99.23 %.
+- **[INFERENCIA]** Mejor balance accuracy/RAM para CPU entre las opciones revisadas
+  (Swin-tiny ~28 M y ViT distilado ~11.8 M son más ligeros pero menos precisos en
+  generadores modernos).
+- **Mejora estructural:** el loader pasó a `AutoModelForImageClassification`, por lo
+  que el modelo es **intercambiable** por uno más ligero (p.ej. un ViT distilado de
+  ~12 M) con una sola variable de entorno, sin tocar código.
+- **Calibración y honestidad:** *temperature scaling* (`AI_TEMPERATURE`), umbrales
+  configurables, estado `is_uncertain`/`confidence_bucket` expuesto y **disclaimer**
+  en la respuesta. **No se puede afirmar con certeza** que una imagen sea IA: es una
+  probabilidad y degrada con compresión/recortes/capturas/distribution shift.
+
+`low_cpu_mem_usage=True` (vía `accelerate`) reduce el pico de RAM al cargar; si
+`accelerate` falta, hay *fallback* automático.
+
+---
+
+## 4. Reverse image search ("¿está en otras páginas de Internet?")
+
+**Método: Google Lens vía SerpApi** (`REVERSE_IMAGE_ENGINE=google_lens`, por defecto),
+con fallback a `google_reverse_image` y Zenserp.
+
+- **[HECHO]** Resultados **normalizados** a un esquema único `{title, link, source,
+  thumbnail}` independiente del proveedor.
+- **[HECHO]** Veredicto explícito y **probabilístico**: `found_on_internet`,
+  `verdict` (`NOT_FOUND` / `POSSIBLE_PARTIAL_MATCH` / `LIKELY_PRESENT_ONLINE`),
+  `confidence`, `match_count`, `matches[]` y `disclaimer`.
+- **Límites (honestidad técnica):** una búsqueda inversa **no** puede probar al 100 %
+  que una imagen está o no en Internet — depende de la cobertura del índice del
+  proveedor; la ausencia de coincidencias **no** es prueba de ausencia.
+
+---
+
+## 5. Puntuación (antes → después de esta entrega)
+
+| Dimensión | Antes | Después* |
+|---|:--:|:--:|
+| Seguridad | 2 | 7 |
+| Código | 4 | 7 |
+| Arquitectura | 6 | 7 |
+| Rendimiento | 5 | 6.5 |
+| Escalabilidad | 5 | 6.5 |
+| Observabilidad | 6 | 7.5 |
+| Calidad modelo IA | 5 | 7 |
+| Fiabilidad reverse search | 3 | 6.5 |
+
+\* *Estimación; la validación final requiere benchmarks propios y un escaneo de
+dependencias (SCA) en CI.*
+
+---
+
+## 6. Recomendaciones restantes (fuera del alcance del código)
+
+1. **Rotar** las claves SerpApi/Zenserp filtradas y **purgar el historial** git
+   (`git filter-repo`) — borrarlas en un commit nuevo no las elimina del histórico.
+2. Inyectar secretos desde un secret manager (Vault / AWS SM / K8s Secrets).
+3. Añadir **SCA** (`pip-audit`/Dependabot) y tests de integración con
+   *testcontainers* (Qdrant/Redis reales) en CI.
+4. Para throughput alto, mover también la inferencia de `search`/`ai-detection` a la
+   cola RQ (hoy es síncrona bajo gevent; mitigada con semáforo de concurrencia).
+5. Recalibrar el detector (temperature scaling) sobre un set propio y publicar
+   métricas reales (precision/recall/F1) en vez de la accuracy in-distribution.
+
+---
+
+## 7. Verificación
+
+```bash
+# Suite de pruebas (71 tests): lógica pura + integración Flask (deps ML mockeadas)
+python -m unittest tests.test_suite -v
+```

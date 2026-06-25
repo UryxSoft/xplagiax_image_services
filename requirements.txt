@@ -13,6 +13,7 @@ torch==2.2.2             # CPU-only; for GPU: torch==2.3.1+cu121
 torchvision==0.17.2
 transformers==4.42.4
 sentence-transformers==3.0.1
+accelerate==0.33.0       # enables low_cpu_mem_usage=True (lower RAM peak on load)
 Pillow==10.4.0
 numpy==1.26.4
 
@@ -37,7 +38,7 @@ opentelemetry-sdk
 opentelemetry-exporter-otlp
 
 # Security & Logic
-imagehash
+imagehash==4.3.1
 
 # Type annotations (stdlib in 3.11+, shim for 3.9/3.10)
 typing_extensions==4.12.2

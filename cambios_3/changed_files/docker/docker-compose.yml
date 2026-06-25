@@ -1,0 +1,116 @@
+version: "3.9"
+
+# ==============================================================
+# xplagiax — Docker Compose
+#
+# This compose file ONLY manages the xplagiax app services:
+#   - xplagiax-api     Flask API (Gunicorn + gevent)
+#   - xplagiax-worker  RQ ML inference worker
+#
+# External services already running in xplagiax-net:
+#   - qdrant           port 6333
+#   - redis-server     port 6379
+#   - seaweedfs-master port 9333
+#   - seaweedfs-volume port 8080
+#   - seaweedfs-filer  port 8888
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f xplagiax-api
+#   docker compose down
+# ==============================================================
+
+services:
+
+  # ------------------------------------------------------------
+  # Flask API
+  # ------------------------------------------------------------
+  xplagiax-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        DOWNLOAD_MODELS: "false"
+    image: xplagiax:latest
+    container_name: xplagiax-api
+    command: api
+    restart: unless-stopped
+    networks:
+      - xplagiax-net
+    ports:
+      - "5010:5004"
+      - "9090:9090"
+    # No env_file: secrets are injected from the shell / secret store, never
+    # committed. `${VAR:?msg}` fails fast if a required secret is missing.
+    environment:
+      REQUIRE_AUTH: "true"
+      SERVICE_API_KEY: ${SERVICE_API_KEY:?set SERVICE_API_KEY}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      SERPAPI_KEY: ${SERPAPI_KEY:-}
+      ZENSERP_KEY: ${ZENSERP_KEY:-}
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      REDIS_HOST: redis-server
+      REDIS_PORT: "6379"
+      SEAWEEDFS_FILER_URL: http://seaweedfs-filer:8888
+      SEAWEEDFS_PUBLIC_URL: ${SEAWEEDFS_PUBLIC_URL:-}
+      SEAWEEDFS_TTL: "1h"
+      IMAGE_BACKEND: seaweedfs_filer
+      MODEL_DEVICE: cpu
+      SERVICE_NAME: xplagiax-api
+      ENVIRONMENT: production
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5004/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+          cpus: "4"
+
+  # ------------------------------------------------------------
+  # ML Worker
+  # ------------------------------------------------------------
+  xplagiax-worker:
+    image: xplagiax:latest
+    container_name: xplagiax-worker
+    command: worker
+    restart: unless-stopped
+    networks:
+      - xplagiax-net
+    # Worker exposes no HTTP, so REQUIRE_AUTH is irrelevant here.
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      REDIS_HOST: redis-server
+      REDIS_PORT: "6379"
+      SEAWEEDFS_FILER_URL: http://seaweedfs-filer:8888
+      SEAWEEDFS_TTL: "1h"
+      IMAGE_BACKEND: seaweedfs_filer
+      MODEL_DEVICE: cpu
+      SERVICE_NAME: xplagiax-worker
+      ENVIRONMENT: production
+      REQUIRE_AUTH: "false"
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+    depends_on:
+      xplagiax-api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+          cpus: "4"
+
+networks:
+  xplagiax-net:
+    external: true
+
+volumes:
+  hf_cache:
+    driver: local

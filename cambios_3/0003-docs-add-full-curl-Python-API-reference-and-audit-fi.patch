@@ -1,0 +1,342 @@
+From 4e6b2ae2edf8917f693315356771d5e0ba1a0810 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 25 Jun 2026 01:06:38 +0000
+Subject: [PATCH 3/3] docs: add full curl + Python API reference and audit
+ findings/fixes table to README
+
+- Per-endpoint usage (curl and Python requests) for images, batch, search,
+  plagiarism, ai-detection, reverse-image, patents, admin and jobs
+- Example responses for ai-detection and reverse-image (new normalized fields)
+- Findings -> severity -> file -> fix table, extra improvements, and the
+  AI model / reverse-search method summary
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Ng6eYN2KAk8JzEYnikRxNn
+---
+ README.md | 313 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 313 insertions(+)
+
+diff --git a/README.md b/README.md
+index 05fd4c7..11e4408 100644
+--- a/README.md
++++ b/README.md
+@@ -1043,3 +1043,316 @@ MIT License — ver [LICENSE](LICENSE) para detalles.
+ Built with ❤️ for production — not just for demos.
+ 
+ </div>
++
++---
++
++# 📖 Referencia completa de la API (curl + Python)
++
++> Base URL de ejemplo: `http://localhost:5010` (ajusta el puerto a tu despliegue).
++> Con `REQUIRE_AUTH=true` (por defecto) **todos** los endpoints de datos exigen
++> `X-API-Key` (o `Authorization: Bearer <key>`). Las operaciones admin destructivas
++> exigen `X-Admin-Key` (ver `ADMIN_API_KEY`).
++
++### Setup común (Python)
++
++```python
++import requests
++
++BASE = "http://localhost:5010"
++HEADERS = {"X-API-Key": "TU_SERVICE_API_KEY"}        # auth normal
++ADMIN  = {"X-Admin-Key": "TU_ADMIN_API_KEY"}         # operaciones destructivas
++```
++
++### Setup común (curl)
++
++```bash
++export BASE=http://localhost:5010
++export API_KEY=TU_SERVICE_API_KEY
++export ADMIN_KEY=TU_ADMIN_API_KEY
++```
++
++---
++
++## 1) Health / readiness
++
++```bash
++curl $BASE/healthz                                   # liveness  (sin auth)
++curl $BASE/readyz                                    # readiness (sin auth, solo booleanos)
++curl -H "X-API-Key: $API_KEY" $BASE/health           # detallado (REQUIERE auth)
++```
++```python
++requests.get(f"{BASE}/healthz").json()
++requests.get(f"{BASE}/readyz").json()
++requests.get(f"{BASE}/health", headers=HEADERS).json()
++```
++
++---
++
++## 2) Subir / indexar imagen — `POST /api/v1/images`
++
++Fuentes admitidas: `file` (multipart), `image_url` (http/https), `image_path`
++(local, solo si `ALLOW_LOCAL_IMAGE_PATH=true`). Campos opcionales: `group_id`,
++`page`, `run_ai_detection` (default true), `extra_*` (metadatos). Devuelve **202**
++(modo async) o **200** (modo degradado síncrono).
++
++```bash
++# Archivo local (multipart)
++curl -X POST $BASE/api/v1/images \
++  -H "X-API-Key: $API_KEY" \
++  -F "file=@/ruta/imagen.jpg" \
++  -F "group_id=proyecto_x" \
++  -F "run_ai_detection=true" \
++  -F "extra_origen=campaña-2026"
++
++# Por URL remota (JSON)
++curl -X POST $BASE/api/v1/images \
++  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
++  -d '{"image_url":"https://ejemplo.com/foto.jpg","group_id":"proyecto_x"}'
++```
++```python
++# Archivo local
++with open("imagen.jpg", "rb") as f:
++    r = requests.post(f"{BASE}/api/v1/images", headers=HEADERS,
++                      files={"file": f},
++                      data={"group_id": "proyecto_x", "run_ai_detection": "true",
++                            "extra_origen": "campaña-2026"})
++print(r.status_code, r.json())
++
++# Por URL
++r = requests.post(f"{BASE}/api/v1/images", headers=HEADERS,
++                  json={"image_url": "https://ejemplo.com/foto.jpg",
++                        "group_id": "proyecto_x"})
++```
++
++---
++
++## 3) Subida por lotes — `POST /api/v1/images/batch` (máx. 20)
++
++```bash
++curl -X POST $BASE/api/v1/images/batch \
++  -H "X-API-Key: $API_KEY" \
++  -F "files=@a.jpg" -F "files=@b.png" -F "group_id=lote1"
++```
++```python
++files = [("files", open("a.jpg","rb")), ("files", open("b.png","rb"))]
++r = requests.post(f"{BASE}/api/v1/images/batch", headers=HEADERS,
++                  files=files, data={"group_id": "lote1"})
++# o por URLs (JSON):
++r = requests.post(f"{BASE}/api/v1/images/batch", headers=HEADERS,
++                  json={"image_urls": ["https://e.com/1.jpg","https://e.com/2.jpg"]})
++```
++
++---
++
++## 4) Obtener / borrar imagen
++
++```bash
++curl -H "X-API-Key: $API_KEY" $BASE/api/v1/images/<point_id> --output out.jpg
++curl -H "X-API-Key: $API_KEY" $BASE/api/v1/images/<point_id>/url
++curl -X DELETE -H "X-API-Key: $API_KEY" $BASE/api/v1/images/<point_id>
++```
++```python
++img = requests.get(f"{BASE}/api/v1/images/{pid}", headers=HEADERS).content
++url = requests.get(f"{BASE}/api/v1/images/{pid}/url", headers=HEADERS).json()
++requests.delete(f"{BASE}/api/v1/images/{pid}", headers=HEADERS)
++```
++
++---
++
++## 5) Búsqueda por similitud — `POST /api/v1/search/similar`
++
++Campos: `file|image_url|image_path`, `limit` (1–50, def 10), `threshold` (0–1),
++`group_id` (opcional).
++
++```bash
++curl -X POST $BASE/api/v1/search/similar \
++  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
++  -d '{"image_url":"https://ejemplo.com/foto.jpg","limit":10,"threshold":0.8}'
++```
++```python
++r = requests.post(f"{BASE}/api/v1/search/similar", headers=HEADERS,
++                  json={"image_url": "https://ejemplo.com/foto.jpg",
++                        "limit": 10, "threshold": 0.8})
++```
++
++---
++
++## 6) Plagio — `POST /api/v1/search/plagiarism`
++
++Campos: `file|image_url`, `similarity_threshold` (def 0.90, clamp 0.5–1.0),
++`limit` (1–20), `group_id`.
++
++```bash
++curl -X POST $BASE/api/v1/search/plagiarism \
++  -H "X-API-Key: $API_KEY" -F "file=@imagen.jpg" -F "similarity_threshold=0.9"
++```
++```python
++with open("imagen.jpg","rb") as f:
++    r = requests.post(f"{BASE}/api/v1/search/plagiarism", headers=HEADERS,
++                      files={"file": f}, data={"similarity_threshold": "0.9"})
++```
++
++---
++
++## 7) Detección de IA — `POST /api/v1/search/ai-detection`
++
++```bash
++curl -X POST $BASE/api/v1/search/ai-detection \
++  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
++  -d '{"image_url":"https://ejemplo.com/foto.jpg"}'
++```
++```python
++r = requests.post(f"{BASE}/api/v1/search/ai-detection", headers=HEADERS,
++                  json={"image_url": "https://ejemplo.com/foto.jpg"})
++```
++Respuesta (ejemplo):
++```json
++{
++  "is_ai": true, "is_human": false, "is_uncertain": false,
++  "label": "ai", "confidence": 0.972, "confidence_bucket": "HIGH",
++  "ai_score": 0.972, "human_score": 0.028,
++  "model_id": "Ateeqq/ai-vs-human-image-detector", "duration_ms": 180.4,
++  "disclaimer": "AI-detection is probabilistic and degrades on compressed, cropped, screenshotted or out-of-distribution images. Do not treat as definitive proof."
++}
++```
++
++---
++
++## 8) Reverse Image Search — `POST /api/v1/patents/reverse-image`
++
++Determina si la imagen aparece en otras páginas (Google Lens vía SerpApi).
++Acepta `image_url`, o `file`/`image_path` (se sube temporalmente y se pasa la URL
++pública al proveedor → requiere `SEAWEEDFS_PUBLIC_URL` accesible). `num_results` (≤50).
++
++```bash
++curl -X POST $BASE/api/v1/patents/reverse-image \
++  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
++  -d '{"image_url":"https://ejemplo.com/foto.jpg","num_results":5}'
++```
++```python
++r = requests.post(f"{BASE}/api/v1/patents/reverse-image", headers=HEADERS,
++                  json={"image_url": "https://ejemplo.com/foto.jpg", "num_results": 5})
++```
++Respuesta (ejemplo, normalizada):
++```json
++{
++  "status": "success",
++  "results": {
++    "found_on_internet": true,
++    "verdict": "LIKELY_PRESENT_ONLINE",
++    "confidence": 0.8,
++    "match_count": 5,
++    "matches": [{"title": "...", "link": "https://...", "source": "...", "thumbnail": "https://..."}],
++    "provider": "serpapi", "engine": "google_lens",
++    "query_image_url": "https://ejemplo.com/foto.jpg",
++    "disclaimer": "Reverse image search is probabilistic: matches indicate a similar image is indexed by the provider; absence of matches does NOT prove the image is not online."
++  },
++  "usage": {"serpapi": {"used": 12, "limit": 250, "remaining": 238, "...": "..."}}
++}
++```
++
++---
++
++## 9) Patentes — text / image / detalle / uso
++
++```bash
++curl -X POST $BASE/api/v1/patents/search/text \
++  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
++  -d '{"query":"solar panel coating","num_results":10}'
++
++curl -X POST $BASE/api/v1/patents/search/image \
++  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
++  -d '{"image_url":"https://ejemplo.com/dibujo.png"}'
++
++curl -H "X-API-Key: $API_KEY" $BASE/api/v1/patents/US1234567B2
++curl -H "X-API-Key: $API_KEY" $BASE/api/v1/patents/usage
++```
++```python
++requests.post(f"{BASE}/api/v1/patents/search/text", headers=HEADERS,
++              json={"query": "solar panel coating", "num_results": 10})
++requests.get(f"{BASE}/api/v1/patents/usage", headers=HEADERS)
++```
++
++---
++
++## 10) Admin (requiere `X-Admin-Key`) y Jobs
++
++```bash
++# Listar items (lectura, X-API-Key)
++curl -H "X-API-Key: $API_KEY" "$BASE/api/v1/admin/collection/items?limit=100&group_id=proyecto_x"
++curl -H "X-API-Key: $API_KEY" $BASE/api/v1/admin/models
++
++# Borrar grupo (destructivo → X-Admin-Key)
++curl -X DELETE -H "X-Admin-Key: $ADMIN_KEY" $BASE/api/v1/admin/collection/groups/proyecto_x
++
++# Reset total (destructivo → X-Admin-Key + token de confirmación)
++curl -X DELETE $BASE/api/v1/admin/collection/reset \
++  -H "X-Admin-Key: $ADMIN_KEY" -H "Content-Type: application/json" \
++  -d '{"confirm":"I_UNDERSTAND_THIS_WILL_DELETE_ALL_DATA"}'
++
++# Estado de job async
++curl -H "X-API-Key: $API_KEY" $BASE/api/v1/jobs/<job_id>
++```
++```python
++requests.get(f"{BASE}/api/v1/admin/collection/items",
++             headers=HEADERS, params={"limit": 100, "group_id": "proyecto_x"})
++requests.delete(f"{BASE}/api/v1/admin/collection/reset", headers=ADMIN,
++                json={"confirm": "I_UNDERSTAND_THIS_WILL_DELETE_ALL_DATA"})
++requests.get(f"{BASE}/api/v1/jobs/{job_id}", headers=HEADERS)   # poll hasta status=done
++```
++
++---
++
++# 🛡️ Hallazgos de auditoría — correcciones y mejoras
++
++Severidad: 🔴 Crítica · 🟠 Alta · 🟡 Media · 🔵 Baja. Todos los items de código están
++**corregidos y verificados** (74 tests). Ver `AUDIT_REPORT.md`.
++
++| # | Hallazgo | Sev. | Archivo | Estado / Fix |
++|---|----------|:----:|---------|--------------|
++| 1 | API keys SerpApi/Zenserp **hardcodeadas** y commiteadas | 🔴 | `app/config.py` | ✅ Solo se leen de entorno. ⚠️ Rotar claves + purgar historial (acción manual) |
++| 2 | **SSRF DNS-rebinding (TOCTOU)** en descarga de URLs | 🔴 | `app/security/http_client.py` | ✅ Resolución única + **IP pinning** (Host/SNI), revalida cada redirección |
++| 3 | Auth **desactivada por defecto** en compose (`env_file`) | 🔴 | `docker/docker-compose.yml` | ✅ `REQUIRE_AUTH=true`, secretos por `${VAR}`, `.env` sin versionar |
++| 4 | `.env` versionado + `result.txt`/`test.py`/`.bak`/`.DS_Store` | 🟠 | repo | ✅ Eliminados y `.gitignore` reforzado |
++| 5 | Rate limiter **roto tras proxy** (CIDR como string) + **fail-open** | 🟠 | `app/security/middleware.py` | ✅ IP por CIDR real + `ProxyFix`; fallback local por proceso (sin bypass) |
++| 6 | `/health` y `/readyz` **sin auth** filtrando infra | 🟠 | `app/routes/blueprints.py` | ✅ `/health` autenticado; `/readyz` solo booleanos |
++| 7 | Una sola API key sin separación admin | 🟡 | middleware/routes | ✅ `require_admin` + `ADMIN_API_KEY` |
++| 8 | **LFI** vía `image_path` | 🟡 | `app/utils/image_fetcher.py` | ✅ Off por defecto (`ALLOW_LOCAL_IMAGE_PATH`) |
++| 9 | **Bomba de descompresión** (decodifica ~300 MB) | 🟠 | `app/utils/image_validation.py` | ✅ Límite de píxeles ANTES de decodificar + rechazo multi-frame |
++| 10 | Etiquetas del detector **frágiles** (riesgo "todo humano") | 🟠 | `app/models/labels.py` | ✅ Resolución robusta que **falla ruidoso** + `AI_LABEL_MAP` |
++| 11 | Abstracción del rotador con **fugas** (JSON crudo por proveedor) | 🟡 | `app/services/api_rotator.py` | ✅ Normalización a DTO único + veredicto |
++| 12 | `@retry` redefinido en el bucle de proveedores | 🔵 | `app/services/api_rotator.py` | ✅ Política de retry única |
++| 13 | `config.debug` cargado pero nunca aplicado | 🔵 | `app/factory.py` | ✅ `app.debug = config.debug` |
++| 14 | `__import__("io")` dinámico | 🔵 | `app/routes/blueprints.py` | ✅ `import io` |
++| 15 | `before_request` parseaba el body en cada request | 🟡 | `app/observability/telemetry.py` | ✅ Sin parseo eager del multipart |
++| 16 | Docstring "HEAD before PUT" inexistente | 🔵 | `app/storage/image_storage.py` | ✅ Corregido (idempotencia por hash) |
++| 17 | **Código muerto**: circuit breaker / cleanup / OTEL | 🟡 | varios | ✅ Los 3 **cableados** (CB en Redis, cleanup real, OTEL si `OTEL_ENABLED`) |
++| 18 | Fuga de temporales (sin TTL) + URL no pública en reverse | 🟡 | storage/blueprints | ✅ TTL por request en filer + aviso si la URL es interna |
++| 19 | Sin correlación API→worker | 🔵 | indexing/ml_worker | ✅ `request_id` propagado al job RQ |
++| 20 | Reverse search con motor obsoleto, sin decisión | 🟠 | `app/services/api_rotator.py` | ✅ **Google Lens** + veredicto `found_on_internet` |
++| 21 | Detector sin calibración ni control de RAM | 🟠 | `app/models/registry.py` | ✅ INT8 + `low_cpu_mem_usage` + temperature scaling + semáforo de concurrencia |
++
++### Mejoras adicionales (más allá de los fixes)
++
++- **Modelo de IA intercambiable**: `AutoModelForImageClassification` + `AI_LABEL_MAP` →
++  cambiar a un modelo ultra-ligero (CPU/poca RAM) con una variable, sin tocar código.
++- **CI** (`.github/workflows/ci.yml`): 74 tests + `pip-audit` (escaneo de dependencias).
++- **Docs**: `docs/MODELS_AND_REVERSE_SEARCH.md` (decisión del modelo y del reverse search).
++- **Observabilidad**: OTEL opcional, métricas Prometheus, `X-Request-ID` extremo a extremo.
++
++### Pendiente (no crítico)
++
++- Mover la inferencia de `search`/`plagiarism`/`ai-detection` a RQ (hoy mitigada con
++  semáforo) · refactor DI de `create_app` · tests con testcontainers · SLO/alerting.
++
++---
++
++## 🤖 Modelo de detección de IA y método de reverse search
++
++- **Detección IA**: `Ateeqq/ai-vs-human-image-detector` — SigLIP2 ViT-B/16 (~86M params),
++  **INT8 ≈ 150–250 MB RAM** en CPU; ~99.23% in-distribution. Configurable con
++  `SIGLIP_MODEL_ID` (+ `AI_LABEL_MAP` para modelos con etiquetas no estándar).
++- **Reverse search**: **Google Lens** vía SerpApi (`REVERSE_IMAGE_ENGINE=google_lens`),
++  con fallback a `google_reverse_image` y Zenserp; resultados normalizados + veredicto.
++- **Honestidad**: ambos son **probabilísticos** — no afirman certeza. Detalle en
++  `docs/MODELS_AND_REVERSE_SEARCH.md`.
+-- 
+2.43.0
+

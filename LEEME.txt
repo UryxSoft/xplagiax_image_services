@@ -1,23 +1,60 @@
-Cambios.tar.gz — reverse-image-search microservice
-====================================================
+CAMBIOS_.TAR.GZ — cambios de esta sesión
+==========================================
 
-Contenido:
-  - Los 24 archivos nuevos/modificados (misma ruta relativa que en el repo),
-    listos para copiar directo sobre tu clon local de xplagiax_image_services.
-  - CAMBIOS.patch — el mismo cambio como diff unificado, por si prefieres
-    aplicarlo con `git apply CAMBIOS.patch` o `patch -p1 < CAMBIOS.patch`
-    desde la raíz del repo.
+CONTEXTO IMPORTANTE
+--------------------
+El PR de la rama anterior (claude/reverse-image-search-microservice-eq9ti9)
+ya fue mergeado a `main` (commits 41e4fa8 y de903ca). Ese merge incluía la
+primera versión del microservicio de reverse image search + el endpoint de
+batch. Este tarball contiene SOLO el trabajo NUEVO hecho después de ese
+merge, aplicado sobre el `main` actual:
 
-Incluye 2 commits locales (firmados, sin publicar por el bloqueo de permisos
-de la integración de GitHub en esta sesión):
-  e074d74  Add lightweight reverse-image-search microservice (no local ML)
-  841a660  Add batch endpoint for reverse-image-search
-    -> POST /api/v1/reverse-image-search/batch (multi-imagen, concurrente
-       entre imagenes, secuencial por proveedor dentro de cada una)
+  1. Mejoras de velocidad y exactitud:
+     - REVERSE_SEARCH_REQUEST_DEADLINE_S (presupuesto de tiempo por request)
+     - REVERSE_SEARCH_MODE=latency (llamar a todos los proveedores en
+       paralelo, opt-in; por defecto sigue siendo "cost"/Early Stop)
+     - REVERSE_SEARCH_BATCH_CONCURRENCY (pool acotado para /batch)
+     - Similarity graduada + corroboración entre proveedores + bonus/penalty
+       de dominios de confianza (todo opt-in, vacío por defecto)
+  2. Circuit breaker por proveedor (reusa app/services/circuit_breaker.py,
+     Redis, misma clase que ya usa api_rotator.py) para fallos SOSTENIDOS
+     entre requests, no solo dentro de un mismo request.
+  3. El deploy standalone (app.reverse_search.app) ahora también sirve
+     /api/v1/patents/* (SerpApi/Zenserp vía api_rotator.py + patents_bp),
+     usando un adaptador nuevo (_TempHostImageStorage) para reusar el
+     hosting efímero ya existente. Sigue sin servir /api/v1/images ni
+     /api/v1/search/* (necesitan CLIP/SigLIP/Qdrant).
+  4. Métricas Prometheus específicas del endpoint de reverse-image-search
+     (antes solo se reusaban las HTTP genéricas).
 
-Para aplicar los archivos sueltos:
-  tar xzf Cambios.tar.gz -C /ruta/a/tu/clon/xplagiax_image_services
+`patent_image_search`, `api_rotator.py` y `patents_bp` en el monolito
+(app/factory.py) NO fueron tocados — cero cambios ahí, verificado con
+`git diff`.
 
-Para aplicar el patch en su lugar:
-  cd /ruta/a/tu/clon/xplagiax_image_services
-  git apply CAMBIOS.patch
+CÓMO APLICAR
+------------
+Opción A (recomendada) — aplicar el patch sobre un `main` limpio:
+
+    git checkout main
+    git pull
+    git checkout -b claude/reverse-image-search-microservice-eq9ti9
+    git apply CAMBIOS.patch
+    git add -A
+    git commit -m "Add speed/accuracy tuning, circuit breaker, patents in standalone"
+    git push -u origin claude/reverse-image-search-microservice-eq9ti9
+
+Opción B — copiar los archivos sueltos de este tarball directamente sobre tu
+copia local del repo (mismas rutas relativas), y luego commitear a mano.
+
+VERIFICACIÓN
+------------
+    pip install gevent  # si no está instalado
+    python -m unittest tests.test_suite tests.test_reverse_search -v
+    # Ran 119 tests — OK
+
+POR QUÉ NO SE PUDO PUSHEAR DIRECTO
+-----------------------------------
+Este entorno no tiene permiso de escritura sobre
+UryxSoft/xplagiax_image_services (git push y la API de GitHub devuelven
+403 "Resource not accessible by integration"). Por eso se entrega este
+tarball en vez de abrir el PR directamente.

@@ -156,7 +156,11 @@ deployments that only need reverse image search — see
 `requirements-reverse-search.txt` and `docker/Dockerfile.reverse-search` /
 `docker/docker-compose.reverse-search.yml`. It shares zero import-time
 dependency on `app.models`, `app.storage.vector_repository`, or
-`app.workers`, so torch/transformers/qdrant-client are never loaded.
+`app.workers`, so torch/transformers/qdrant-client are never loaded. The
+standalone deploy also serves `/api/v1/patents/*` (SerpApi/Zenserp — see
+below) since that feature has the same zero-heavy-ML footprint; it does
+**not** serve `/api/v1/images` or `/api/v1/search/*`, which need the
+Qdrant/CLIP/SigLIP stack and only exist in the monolith.
 
 ### Health & Monitoring
 
@@ -773,7 +777,10 @@ SHA-256) se sirven desde cache sin llamar a ningún proveedor. Ver
 Este módulo también puede correr como **microservicio standalone sin
 torch**, para despliegues que solo necesitan reverse image search — ver
 `requirements-reverse-search.txt` y `docker/Dockerfile.reverse-search` /
-`docker/docker-compose.reverse-search.yml`.
+`docker/docker-compose.reverse-search.yml`. El standalone también sirve
+`/api/v1/patents/*` (SerpApi/Zenserp), porque esa función tiene el mismo
+perfil sin IA local; **no** sirve `/api/v1/images` ni `/api/v1/search/*`,
+que necesitan el stack Qdrant/CLIP/SigLIP y solo existen en el monolito.
 
 ---
 

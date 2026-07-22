@@ -19,6 +19,7 @@ from __future__ import annotations
 import random
 import time
 from typing import Callable, Optional, TypeVar
+from urllib.parse import urlparse
 
 from app.reverse_search.models import ProviderMatch
 
@@ -78,19 +79,31 @@ class ReverseSearchProvider:
     name: str = "base"
 
     def search(
-        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float
+        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float,
+        deadline: Optional[float] = None,
     ) -> Optional[ProviderMatch]:
         """Return the best match, or None if the provider found nothing.
-        Raise a ProviderError subclass if the call itself failed."""
+        Raise a ProviderError subclass if the call itself failed.
+
+        `deadline` is an optional absolute time.perf_counter() value: once
+        past it, retry_call() stops retrying even if attempts remain, so one
+        slow/flaky provider can't blow through the whole request's time
+        budget before the chain even reaches the next provider.
+        """
         raise NotImplementedError
 
 
-def retry_call(fn: Callable[[], T], *, max_retries: int) -> T:
+def retry_call(fn: Callable[[], T], *, max_retries: int, deadline: Optional[float] = None) -> T:
     """
     Call fn() with retry ONLY for ProviderRateLimitError / ProviderTransientError.
     Backoff: the provider's own Retry-After (429) when given, else capped
     exponential (0.5s, 1s, 2s, 4s) plus a little jitter to avoid thundering
     herds across concurrent requests.
+
+    If `deadline` is set, a retry is skipped (the last exception is
+    re-raised immediately) once we're at or past it — better to move on to
+    the next provider in the chain than sleep through the rest of the
+    request's time budget.
     """
     attempt = 0
     while True:
@@ -100,6 +113,19 @@ def retry_call(fn: Callable[[], T], *, max_retries: int) -> T:
             attempt += 1
             if attempt > max_retries:
                 raise
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise
             retry_after = getattr(exc, "retry_after", None)
             delay = min(float(retry_after), 10.0) if retry_after else min(0.5 * (2 ** (attempt - 1)), 4.0)
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - time.perf_counter()))
             time.sleep(delay + random.uniform(0, 0.25))
+
+
+def hostname_of(url: str) -> str:
+    """Shared by orchestrator (corroboration/domain trust) and provider
+    adapters (deriving a display name when a page has no title)."""
+    try:
+        return (urlparse(url).hostname or url).lower()
+    except ValueError:
+        return url.lower()

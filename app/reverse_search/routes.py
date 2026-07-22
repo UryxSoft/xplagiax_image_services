@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-import gevent
+from gevent.pool import Pool as GeventPool
 from flask import Blueprint, Response, current_app, jsonify, request
 from werkzeug.datastructures import FileStorage
 
@@ -45,6 +45,7 @@ logger = get_logger(__name__)
 reverse_search_bp = Blueprint("reverse_search", __name__, url_prefix="/api/v1")
 
 _DEFAULT_MAX_BATCH_SIZE = 20
+_DEFAULT_BATCH_CONCURRENCY = 10
 
 
 def _svc(name: str):
@@ -120,6 +121,7 @@ def reverse_image_search_batch():
 
     rs_cfg = _svc("reverse_search_config")
     max_batch_size = rs_cfg.max_batch_size if rs_cfg else _DEFAULT_MAX_BATCH_SIZE
+    batch_concurrency = rs_cfg.batch_concurrency if rs_cfg else _DEFAULT_BATCH_CONCURRENCY
 
     params = (request.get_json(silent=True) or {}) if request.is_json else request.form.to_dict()
     files = request.files.getlist("files")
@@ -160,17 +162,24 @@ def reverse_image_search_batch():
         payload["source"] = source
         return payload
 
-    greenlets = [gevent.spawn(run_job, job) for job in jobs]
-    gevent.joinall(greenlets)
-    results = [g.value for g in greenlets]
+    # Bounded concurrency: images are independent so they run at the same
+    # time, but a full batch firing every image at once would both risk
+    # exhausting the shared connection pool and look like a burst to the
+    # external provider. GeventPool caps how many run simultaneously,
+    # queuing the rest, while still returning results in job order.
+    pool = GeventPool(size=max(1, batch_concurrency))
+    results = pool.map(run_job, jobs)
 
-    return jsonify({"count": len(results), "results": results}), 207
+    return jsonify({"count": len(results), "results": list(results)}), 207
 
 
 @reverse_search_bp.route("/_tmp-image/<token>", methods=["GET"])
 def serve_temp_image(token: str):
-    orchestrator = _svc("reverse_search_orchestrator")
-    temp_host = orchestrator.temp_host if orchestrator else None
+    # Read from the shared xplagiax_temp_host extension (not the
+    # orchestrator's own) so other features — e.g. patents_bp's file-upload
+    # path in the standalone app — can reuse the exact same ephemeral
+    # hosting without needing an orchestrator instance to exist at all.
+    temp_host = _svc("temp_host")
     if temp_host is None:
         return jsonify({"error": "Not found", "code": "NOT_FOUND"}), 404
 

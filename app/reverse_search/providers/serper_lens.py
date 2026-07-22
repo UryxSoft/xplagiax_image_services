@@ -17,10 +17,10 @@ matches, so — like Vision — we assign a fixed confidence to the top match.
 from __future__ import annotations
 
 from typing import Optional
-from urllib.parse import urlparse
 
 import requests
 
+from app.observability.telemetry import get_logger
 from app.reverse_search.models import ProviderMatch
 from app.reverse_search.providers.base import (
     ProviderAuthError,
@@ -29,11 +29,21 @@ from app.reverse_search.providers.base import (
     ProviderTimeoutError,
     ProviderTransientError,
     ReverseSearchProvider,
+    hostname_of,
     retry_call,
 )
 
+logger = get_logger(__name__)
+
 _ENDPOINT = "https://google.serper.dev/lens"
-_SIMILARITY_TOP_MATCH = 92.0  # Serper Lens ranks by relevance but gives no numeric score
+# Serper Lens ranks by relevance but gives no numeric score. More independent
+# organic matches for the same image is itself corroborating evidence, so we
+# scale the top match's similarity by how many results came back instead of
+# reporting the same fixed number regardless.
+_SIMILARITY_TOP_MATCH_BASE = 88.0
+_SIMILARITY_TOP_MATCH_MAX = 96.0
+_CORROBORATION_STEP = 1.0
+_CORROBORATION_STEP_CAP = 8
 
 
 class SerperLensProvider(ReverseSearchProvider):
@@ -47,7 +57,8 @@ class SerperLensProvider(ReverseSearchProvider):
         self._max_retries = max_retries
 
     def search(
-        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float
+        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float,
+        deadline: Optional[float] = None,
     ) -> Optional[ProviderMatch]:
         if not image_url:
             # Should never happen: the orchestrator hosts the image before
@@ -56,6 +67,7 @@ class SerperLensProvider(ReverseSearchProvider):
         return retry_call(
             lambda: self._search_once(image_url, timeout_s),
             max_retries=self._max_retries,
+            deadline=deadline,
         )
 
     def _search_once(self, image_url: str, timeout_s: float) -> Optional[ProviderMatch]:
@@ -90,17 +102,15 @@ class SerperLensProvider(ReverseSearchProvider):
 
         matches = payload.get("organic") or []
         if not matches:
+            logger.debug("serper_lens_no_match_in_response", response_keys=sorted(payload.keys()))
             return None
         top = matches[0]
         url = top.get("link") or ""
         if not url:
             return None
-        website = top.get("title") or top.get("source") or _hostname(url)
-        return ProviderMatch(website=website, url=url, similarity=_SIMILARITY_TOP_MATCH)
-
-
-def _hostname(url: str) -> str:
-    try:
-        return urlparse(url).hostname or url
-    except ValueError:
-        return url
+        website = top.get("title") or top.get("source") or hostname_of(url)
+        similarity = min(
+            _SIMILARITY_TOP_MATCH_MAX,
+            _SIMILARITY_TOP_MATCH_BASE + _CORROBORATION_STEP * min(len(matches) - 1, _CORROBORATION_STEP_CAP),
+        )
+        return ProviderMatch(website=website, url=url, similarity=similarity)

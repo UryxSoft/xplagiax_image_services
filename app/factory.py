@@ -216,7 +216,7 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
     # ------------------------------------------------------------------ #
     # 9. API Rotator                                                      #
     # ------------------------------------------------------------------ #
-    api_rotator = _build_api_rotator(config, cache, raw_redis)
+    api_rotator = build_api_rotator(config, cache, raw_redis)
     app.extensions["xplagiax_api_rotator"] = api_rotator
 
     # ------------------------------------------------------------------ #
@@ -225,8 +225,21 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
     #     app/reverse_search/. Also deployable standalone via            #
     #     app.reverse_search.app:create_app for a torch-free process.)   #
     # ------------------------------------------------------------------ #
+    # Shared ephemeral public-hosting instance: reverse_search's own
+    # URL-based providers (Serper Lens) AND patents_bp's file-upload path
+    # both need to expose raw bytes at a short-lived public URL, so both
+    # reuse this one object instead of each building their own.
+    from app.reverse_search.temp_hosting import TempImageHost
+    shared_temp_host = TempImageHost(
+        cache, public_base_url=config.reverse_search.public_base_url,
+        ttl_s=config.reverse_search.temp_hosting_ttl,
+    )
+    app.extensions["xplagiax_temp_host"] = shared_temp_host
+
     from app.reverse_search.factory import build_reverse_search_orchestrator
-    reverse_search_orchestrator = build_reverse_search_orchestrator(config.reverse_search, cache)
+    reverse_search_orchestrator = build_reverse_search_orchestrator(
+        config.reverse_search, cache, temp_host=shared_temp_host,
+    )
     app.extensions["xplagiax_reverse_search_orchestrator"] = reverse_search_orchestrator
     app.extensions["xplagiax_reverse_search_config"] = config.reverse_search
 
@@ -285,10 +298,12 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
 
 
 # ---------------------------------------------------------------------------
-# API Rotator factory helper
+# API Rotator factory helper — public (not _-prefixed): also reused by the
+# standalone reverse-search entrypoint (app/reverse_search/app.py), since
+# api_rotator.py itself has zero heavy-ML dependencies.
 # ---------------------------------------------------------------------------
 
-def _build_api_rotator(config: AppConfig, cache, redis_client=None):
+def build_api_rotator(config: AppConfig, cache, redis_client=None):
     from app.services.api_rotator import (
         ProviderConfig,
         SmartApiRotator,

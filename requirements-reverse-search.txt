@@ -23,8 +23,11 @@ Pillow==10.4.0
 # SHA-256 result cache + ephemeral temp-hosting for URL-based providers
 redis==5.0.8
 
-# HTTP client for calling external reverse-image-search providers
+# HTTP client for calling external reverse-image-search providers, and for
+# app.services.api_rotator (patents_bp — SerpApi/Zenserp, wired in alongside
+# reverse-image-search since it has the same zero-heavy-ML footprint)
 requests==2.32.3
+tenacity==8.3.0
 
 # Observability
 structlog==24.4.0

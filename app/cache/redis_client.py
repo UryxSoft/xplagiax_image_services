@@ -268,6 +268,13 @@ class CacheClient:
     def available(self) -> bool:
         return self._available
 
+    @property
+    def raw(self) -> Optional["redis.Redis"]:
+        """The underlying redis.Redis client (None if unavailable), for
+        callers that need raw Redis primitives this wrapper doesn't expose
+        (e.g. CircuitBreaker's own get/incr/expire/set/delete calls)."""
+        return self._redis
+
     def health_check(self) -> dict:
         if self._redis is None:
             return {"status": "unavailable", "mode": "degraded"}

@@ -216,6 +216,28 @@ class ReverseSearchConfig:
     mungfali_api_key: Optional[str]
     mungfali: ProviderSettings
 
+    # Speed — request-level retry budget and an opt-in parallel mode that
+    # trades quota for latency (default "cost" keeps the original sequential
+    # Early Stop behavior unchanged).
+    request_deadline_s: float = 12.0
+    mode: str = "cost"                # "cost" (sequential Early Stop) | "latency" (parallel race)
+    batch_concurrency: int = 10       # cap on concurrent images processed within one /batch request
+
+    # Accuracy — corroboration across providers/domains. Bonus/penalty lists
+    # are empty by default: they only take effect once explicitly populated,
+    # never invent trust judgements on their own.
+    corroboration_bonus: float = 5.0
+    trusted_domains: frozenset = frozenset()
+    trusted_domain_bonus: float = 3.0
+    distrusted_domains: frozenset = frozenset()
+    distrusted_domain_penalty: float = 10.0
+
+    # Per-provider circuit breaker (Redis-backed, shared with app.services
+    # .circuit_breaker.CircuitBreaker — already used by api_rotator.py) for
+    # SUSTAINED failures across requests, not just retries within one.
+    circuit_failure_threshold: int = 5
+    circuit_recovery_s: int = 120
+
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -407,6 +429,20 @@ def load_config() -> AppConfig:
             timeout_s=_optional_float("MUNGFALI_TIMEOUT", 5.0),
             requires_public_url=True,
         ),
+        request_deadline_s=_optional_float("REVERSE_SEARCH_REQUEST_DEADLINE_S", 12.0),
+        mode=_optional("REVERSE_SEARCH_MODE", "cost"),
+        batch_concurrency=_optional_int("REVERSE_SEARCH_BATCH_CONCURRENCY", 10),
+        corroboration_bonus=_optional_float("REVERSE_SEARCH_CORROBORATION_BONUS", 5.0),
+        trusted_domains=frozenset(
+            d.strip().lower() for d in _optional("REVERSE_SEARCH_TRUSTED_DOMAINS", "").split(",") if d.strip()
+        ),
+        trusted_domain_bonus=_optional_float("REVERSE_SEARCH_TRUSTED_DOMAIN_BONUS", 3.0),
+        distrusted_domains=frozenset(
+            d.strip().lower() for d in _optional("REVERSE_SEARCH_DISTRUSTED_DOMAINS", "").split(",") if d.strip()
+        ),
+        distrusted_domain_penalty=_optional_float("REVERSE_SEARCH_DISTRUSTED_DOMAIN_PENALTY", 10.0),
+        circuit_failure_threshold=_optional_int("REVERSE_SEARCH_CIRCUIT_FAILURE_THRESHOLD", 5),
+        circuit_recovery_s=_optional_int("REVERSE_SEARCH_CIRCUIT_RECOVERY_S", 120),
     )
     if reverse_search.enabled and not (google_vision_api_key or serper_api_key or mungfali_api_key):
         logger.warning(

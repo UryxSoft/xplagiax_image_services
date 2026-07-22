@@ -218,6 +218,26 @@ class Metrics:
             ["provider"],
         )
 
+        # Reverse image search (app/reverse_search) — separate from the
+        # generic http_request_duration above so per-provider latency and
+        # match-quality can be watched independently of overall HTTP timings.
+        self.reverse_search_provider_duration = Histogram(
+            "reverse_search_provider_duration_seconds",
+            "Reverse-search provider call latency",
+            ["provider", "status"],
+            buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+        )
+        self.reverse_search_similarity = Histogram(
+            "reverse_search_similarity_distribution",
+            "Distribution of similarity scores returned by reverse-search providers",
+            buckets=[50.0, 60.0, 70.0, 80.0, 90.0, 95.0, 98.0, 99.0, 100.0],
+        )
+        self.reverse_search_completed_total = Counter(
+            "reverse_search_completed_total",
+            "Reverse-search requests completed",
+            ["found", "stop_reason", "cache_hit"],
+        )
+
         # Jobs (async indexing)
         self.jobs_enqueued = Counter("jobs_enqueued_total", "Async jobs enqueued", ["job_type"])
         self.jobs_completed = Counter("jobs_completed_total", "Async jobs completed", ["job_type", "status"])

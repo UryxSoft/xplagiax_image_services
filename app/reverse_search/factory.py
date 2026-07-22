@@ -22,26 +22,51 @@ from app.reverse_search.providers.google_vision import GoogleVisionProvider
 from app.reverse_search.providers.mungfali import MungfaliProvider
 from app.reverse_search.providers.serper_lens import SerperLensProvider
 from app.reverse_search.temp_hosting import TempImageHost
+from app.services.circuit_breaker import CircuitBreaker
 
 logger = get_logger(__name__)
 
 
 def build_reverse_search_orchestrator(
-    config: ReverseSearchConfig, cache_client
+    config: ReverseSearchConfig, cache_client, temp_host: Optional[TempImageHost] = None,
 ) -> Optional[ReverseSearchOrchestrator]:
     """
     Returns None when the feature is disabled or no provider is usable.
     Callers (routes) must handle that as a 503 — never assume a non-None result.
+
+    `temp_host` lets a caller share ONE ephemeral-hosting instance across
+    multiple features (e.g. the standalone app also uses it to serve
+    patents_bp's file-upload path) instead of this factory always building
+    its own. When omitted, the existing behavior applies: build one only if
+    a URL-based provider is actually configured.
     """
     if not config.enabled:
         return None
 
     # One pooled, keep-alive session shared by every provider adapter in this
     # process — avoids a fresh TCP/TLS handshake on every external API call.
+    # Sized so a single full /batch request can't exhaust the pool: a batch
+    # of max_batch_size images each calling out to the same provider would
+    # otherwise contend for a pool smaller than the batch itself.
+    pool_size = max(20, config.max_batch_size * 2)
     session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=pool_size, max_retries=0)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
+    # Redis-backed breaker per provider, tracking SUSTAINED failures across
+    # requests (not just retries within one) — degrades to "always allowed"
+    # if Redis is down, same graceful-degradation contract as everywhere
+    # else in this app. Reuses api_rotator.py's own CircuitBreaker class.
+    raw_redis = getattr(cache_client, "raw", None)
+
+    def _breaker(name: str) -> CircuitBreaker:
+        return CircuitBreaker(
+            redis_client=raw_redis,
+            name=f"reverse_search:{name}",
+            failure_threshold=config.circuit_failure_threshold,
+            recovery_timeout_secs=config.circuit_recovery_s,
+        )
 
     slots: list[ProviderSlot] = []
 
@@ -55,6 +80,7 @@ def build_reverse_search_orchestrator(
             stop_threshold=config.google_vision.stop_threshold,
             timeout_s=config.google_vision.timeout_s,
             requires_public_url=config.google_vision.requires_public_url,
+            breaker=_breaker("google_vision"),
         ))
 
     if config.serper.enabled and config.serper_api_key:
@@ -67,6 +93,7 @@ def build_reverse_search_orchestrator(
             stop_threshold=config.serper.stop_threshold,
             timeout_s=config.serper.timeout_s,
             requires_public_url=config.serper.requires_public_url,
+            breaker=_breaker("serper"),
         ))
 
     if config.mungfali.enabled and config.mungfali_api_key:
@@ -77,6 +104,7 @@ def build_reverse_search_orchestrator(
             stop_threshold=config.mungfali.stop_threshold,
             timeout_s=config.mungfali.timeout_s,
             requires_public_url=config.mungfali.requires_public_url,
+            breaker=_breaker("mungfali"),
         ))
 
     if not slots:
@@ -89,10 +117,11 @@ def build_reverse_search_orchestrator(
     reverse_cache = ReverseSearchCache(
         cache_client, ttl_found=config.cache_ttl_found, ttl_not_found=config.cache_ttl_not_found
     )
-    temp_host = TempImageHost(
-        cache_client, public_base_url=config.public_base_url, ttl_s=config.temp_hosting_ttl
-    ) if any(s.requires_public_url for s in slots) else None
+    if temp_host is None and any(s.requires_public_url for s in slots):
+        temp_host = TempImageHost(
+            cache_client, public_base_url=config.public_base_url, ttl_s=config.temp_hosting_ttl
+        )
 
     return ReverseSearchOrchestrator(
-        slots=slots, cache=reverse_cache, temp_host=temp_host, max_providers=config.max_providers
+        slots=slots, cache=reverse_cache, temp_host=temp_host, config=config,
     )

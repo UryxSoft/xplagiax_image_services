@@ -45,16 +45,26 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 
 # Only the packages this service actually imports — deliberately excludes
-# app/models, app/storage, app/services/{similarity,indexing}.py and
-# app/workers, so the "no local ML" guarantee is visible in the build itself,
-# not just in requirements-reverse-search.txt.
+# app/models, app/storage/vector_repository.py, app/services/{similarity,
+# indexing}.py and app/workers, so the "no local ML" guarantee is visible in
+# the build itself, not just in requirements-reverse-search.txt.
+#
+# app/services/api_rotator.py + app/routes/blueprints.py (patents_bp) are
+# included: they power /api/v1/patents/* (SerpApi/Zenserp), a separate,
+# older feature that's just as ML-free as reverse_search itself, so it rides
+# along in this same lightweight image. app/factory.py is copied ONLY for
+# its build_api_rotator() DI helper, reused instead of duplicated — its own
+# create_app() (which DOES need torch/qdrant) is never called here.
 COPY app/__init__.py                   ./app/__init__.py
 COPY app/config.py                     ./app/config.py
+COPY app/factory.py                    ./app/factory.py
 COPY app/reverse_search/               ./app/reverse_search/
 COPY app/security/                     ./app/security/
 COPY app/observability/                ./app/observability/
 COPY app/cache/                        ./app/cache/
 COPY app/utils/                        ./app/utils/
+COPY app/services/                     ./app/services/
+COPY app/routes/                       ./app/routes/
 COPY docker/gunicorn.reverse_search.conf.py ./gunicorn.conf.py
 
 RUN mkdir -p /tmp/reverse_search && \

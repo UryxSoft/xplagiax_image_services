@@ -207,8 +207,88 @@ Stop. El `requests.Session` compartido ya era usado concurrentemente entre
 requests de distintos clientes bajo el worker gevent; esto extiende la misma
 propiedad dentro de un solo request.
 
-### 8.6 Verificación
+### 8.6 Velocidad y exactitud (segunda iteración)
+
+Mejoras aplicadas a pedido, sobre lo ya construido en 8.1–8.5:
+
+**Velocidad**
+- `REVERSE_SEARCH_REQUEST_DEADLINE_S` (12s por defecto): presupuesto de
+  tiempo para reintentos de TODO el request. Una vez superado, `retry_call`
+  deja de reintentar y la cadena secuencial deja de probar proveedores
+  siguientes — antes un proveedor caído podía sumar hasta ~8s de reintentos
+  antes de pasar al siguiente, sin ningún límite superior.
+- `REVERSE_SEARCH_MODE=latency` (opt-in, default sigue siendo `cost`):
+  llama a todos los proveedores configurados **concurrentemente** via
+  gevent en vez de secuencialmente. El tiempo total pasa a ser el del
+  proveedor más lento en vez de la suma de todos, a cambio de gastar
+  siempre la cuota de todos — trade-off explícito, nunca implícito.
+  Override por request vía `orchestrator.search(..., mode="latency")`.
+- `REVERSE_SEARCH_BATCH_CONCURRENCY` (10 por defecto): el batch ya no
+  lanza N greenlets sin límite — usa un `gevent.pool.Pool` acotado,
+  independiente de `MAX_BATCH_SIZE`, para no agotar el connection pool ni
+  parecer una ráfaga ante el proveedor externo. `pool_maxsize` del
+  `requests.Session` compartido también se dimensiona en función de
+  `MAX_BATCH_SIZE` en `factory.py`.
+
+**Exactitud**
+- Similarity graduada por evidencia corroborante: Vision y Serper ya no
+  devuelven una constante fija por banda — el score sube (acotado) según
+  cuántas coincidencias/páginas independientes se encontraron.
+- **Corroboración entre proveedores**: si dos proveedores DISTINTOS
+  reportan el mismo hostname en el mismo request, se aplica un bono
+  configurable (`REVERSE_SEARCH_CORROBORATION_BONUS`, 5 por defecto) —
+  antes esa señal se descartaba por completo.
+- Dominios de confianza/desconfianza opcionales
+  (`REVERSE_SEARCH_TRUSTED_DOMAINS` / `_DISTRUSTED_DOMAINS`), vacíos por
+  defecto — no se inventó ningún juicio de valor sobre ningún dominio, el
+  mecanismo solo actúa si se configura explícitamente.
+- Logging DEBUG del shape crudo de la respuesta cuando un proveedor no
+  produce match (`google_vision_no_match_in_response` /
+  `serper_lens_no_match_in_response`) — para diagnosticar rápido si el
+  contrato real de la API difiere de lo asumido, el día que se pruebe con
+  claves reales (pendiente — ver §8.2, RS1).
+- **Sin cambios**: seguimos sin poder validar el contrato real de
+  Vision/Serper (no hay claves de prueba disponibles en este entorno) —
+  ese sigue siendo el riesgo de exactitud más importante, no uno que se
+  pueda resolver con más código.
+
+**Observabilidad**
+- Métricas Prometheus específicas del endpoint, además de las HTTP
+  genéricas ya existentes: `reverse_search_provider_duration_seconds`
+  (histograma, labels `provider`/`status`), `reverse_search_similarity`
+  (histograma) y `reverse_search_completed_total` (counter, labels
+  `found`/`stop_reason`/`cache_hit`) — ver `app/observability/telemetry.py`
+  y su uso en `orchestrator.py::_call_provider`.
+
+### 8.7 Circuit breaker por proveedor + patents_bp en el standalone (tercera iteración)
+
+- **Circuit breaker reutilizado**: cada proveedor de reverse_search ahora
+  tiene su propio `CircuitBreaker` (Redis, la MISMA clase de
+  `app/services/circuit_breaker.py` que ya usa `api_rotator.py` — no se
+  reimplementó nada). A diferencia del `request_deadline_s` (§8.6, que solo
+  acota reintentos DENTRO de un request), el breaker recuerda fallos
+  SOSTENIDOS entre requests: si un proveedor falla `CIRCUIT_FAILURE_THRESHOLD`
+  veces seguidas, se deja de intentar por `CIRCUIT_RECOVERY_S` segundos —
+  ni siquiera se hace la llamada HTTP. Se degrada a "siempre permitido" si
+  Redis no está disponible, mismo contrato que el resto del proyecto.
+- **`patent_image_search` y todo `api_rotator.py`/`patents_bp` quedan
+  intactos** — cero cambios (verificado con `git diff` contra la base).
+- **El deploy standalone ahora también sirve `/api/v1/patents/*`**:
+  `api_rotator.py` y `routes/blueprints.py` no tienen ninguna dependencia
+  pesada (`grep` de imports confirmó solo `requests`/`tenacity`/stdlib), así
+  que se cablean igual que reverse_search. La única pieza que patents_bp
+  necesitaba y que SÍ es pesada normalmente (`image_storage.py` +
+  `images_bp` para subir un archivo y obtener una URL pública) se
+  reemplazó por un adaptador (`_TempHostImageStorage`) que reutiliza el
+  mismo `TempImageHost` efímero que ya existía para Serper Lens — mismo
+  mecanismo, cero infraestructura nueva. Sigue sin servir `/api/v1/images`
+  ni `/api/v1/search/*` (necesitan Qdrant/CLIP/SigLIP).
+- Verificado con `sys.modules` tras importar `app.reverse_search.app`: torch,
+  transformers, sentence_transformers, qdrant_client y los submódulos
+  pesados de `app` siguen sin cargarse, incluso con patents_bp wireado.
+
+### 8.8 Verificación
 
 ```bash
-python -m unittest tests.test_reverse_search -v   # 21 tests
+python -m unittest tests.test_reverse_search -v   # 37 tests
 ```

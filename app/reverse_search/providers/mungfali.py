@@ -38,7 +38,8 @@ class MungfaliProvider(ReverseSearchProvider):
         self._api_key = api_key
 
     def search(
-        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float
+        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float,
+        deadline: Optional[float] = None,
     ) -> Optional[ProviderMatch]:
         raise ProviderUnavailableError(
             self.name,

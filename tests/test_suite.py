@@ -331,7 +331,8 @@ class TestApiRoutes(unittest.TestCase):
         from app.factory import create_app
         from app.config import (
             AppConfig, QdrantConfig, RedisConfig, ModelConfig,
-            ApiRotatorConfig, SecurityConfig, StorageConfig, ObservabilityConfig
+            ApiRotatorConfig, SecurityConfig, StorageConfig, ObservabilityConfig,
+            ReverseSearchConfig, ProviderSettings,
         )
 
         import dataclasses
@@ -381,6 +382,27 @@ class TestApiRoutes(unittest.TestCase):
                 prometheus_enabled=False, prometheus_port=9999,
                 otel_enabled=False, otel_endpoint=None,
                 service_name="test-service", environment="test",
+            ),
+            reverse_search=ReverseSearchConfig(
+                enabled=False,
+                max_providers=3, max_retries=1, max_batch_size=20,
+                cache_ttl_found=300, cache_ttl_not_found=60,
+                public_base_url=None, temp_hosting_ttl=30,
+                google_vision_api_key=None,
+                google_vision=ProviderSettings(
+                    enabled=False, priority=1, stop_threshold=98.0,
+                    timeout_s=1.0, requires_public_url=False,
+                ),
+                serper_api_key=None,
+                serper=ProviderSettings(
+                    enabled=False, priority=2, stop_threshold=95.0,
+                    timeout_s=1.0, requires_public_url=True,
+                ),
+                mungfali_api_key=None,
+                mungfali=ProviderSettings(
+                    enabled=False, priority=3, stop_threshold=90.0,
+                    timeout_s=1.0, requires_public_url=True,
+                ),
             ),
             debug=False,
             workers=1,

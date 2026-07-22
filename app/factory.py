@@ -220,6 +220,17 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
     app.extensions["xplagiax_api_rotator"] = api_rotator
 
     # ------------------------------------------------------------------ #
+    # 9b. Reverse Image Search — lightweight external-API orchestrator   #
+    #     (independent of the CLIP/SigLIP/Qdrant stack above; see        #
+    #     app/reverse_search/. Also deployable standalone via            #
+    #     app.reverse_search.app:create_app for a torch-free process.)   #
+    # ------------------------------------------------------------------ #
+    from app.reverse_search.factory import build_reverse_search_orchestrator
+    reverse_search_orchestrator = build_reverse_search_orchestrator(config.reverse_search, cache)
+    app.extensions["xplagiax_reverse_search_orchestrator"] = reverse_search_orchestrator
+    app.extensions["xplagiax_reverse_search_config"] = config.reverse_search
+
+    # ------------------------------------------------------------------ #
     # 10. Security config (available to decorators via extensions)       #
     # ------------------------------------------------------------------ #
     app.extensions["xplagiax_security_config"] = config.security
@@ -236,7 +247,8 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
         patents_bp,
         search_bp,
     )
-    for bp in (health_bp, images_bp, search_bp, patents_bp, admin_bp, jobs_bp):
+    from app.reverse_search.routes import reverse_search_bp
+    for bp in (health_bp, images_bp, search_bp, patents_bp, admin_bp, jobs_bp, reverse_search_bp):
         app.register_blueprint(bp)
 
     # ------------------------------------------------------------------ #
@@ -266,6 +278,7 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
             "/api/v1/images", "/api/v1/search/similar",
             "/api/v1/search/plagiarism", "/api/v1/search/ai-detection",
             "/api/v1/patents/search/image", "/api/v1/admin/collection/items",
+            "/api/v1/reverse-image-search",
         ],
     )
     return app

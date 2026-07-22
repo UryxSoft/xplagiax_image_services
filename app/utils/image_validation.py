@@ -58,28 +58,19 @@ class ImageValidationError(ValueError):
 # Public API
 # ---------------------------------------------------------------------------
 
-def validate_and_load(
+def _validate_header(
     file_bytes: bytes,
-    max_bytes: int = 20 * 1024 * 1024,
-    allowed_mimes: Optional[frozenset] = None,
-    max_pixels: int = _DEFAULT_MAX_PIXELS,
-) -> Tuple[Image.Image, str]:
+    max_bytes: int,
+    allowed_mimes: Optional[frozenset],
+    max_pixels: int,
+) -> Tuple[str, int, int, int]:
     """
-    Validate image bytes and return a loaded PIL Image + detected mime type.
+    Shared steps 1-4 (size, magic bytes, allowlist, header+integrity probe)
+    used by both validate_and_load() (which also decodes to RGB) and
+    validate_image_header() (which does not — see that function's docstring).
 
-    Steps (fail-fast order):
-      1. Size limit
-      2. Magic byte detection
-      3. Mime allowlist
-      4. Header parse (lazy) → dimension + pixel-count + frame checks
-         BEFORE decoding pixels (prevents decompression-bomb RAM blow-up)
-      5. Integrity verify() then decode to RGB
-
-    Returns:
-        (PIL.Image in RGB mode, detected_mime_type)
-
-    Raises:
-        ImageValidationError: on any validation failure (use 400/413 response)
+    Returns (detected_mime, width, height, n_frames).
+    Raises ImageValidationError on any failure.
     """
     if allowed_mimes is None:
         allowed_mimes = frozenset({"jpeg", "png", "webp", "bmp", "tiff", "gif"})
@@ -135,6 +126,40 @@ def validate_and_load(
             f"Animated / multi-page images are not allowed ({n_frames} frames)."
         )
 
+    return detected_mime, w, h, n_frames
+
+
+def validate_and_load(
+    file_bytes: bytes,
+    max_bytes: int = 20 * 1024 * 1024,
+    allowed_mimes: Optional[frozenset] = None,
+    max_pixels: int = _DEFAULT_MAX_PIXELS,
+) -> Tuple[Image.Image, str]:
+    """
+    Validate image bytes and return a loaded PIL Image + detected mime type.
+
+    Steps (fail-fast order):
+      1. Size limit
+      2. Magic byte detection
+      3. Mime allowlist
+      4. Header parse (lazy) → dimension + pixel-count + frame checks
+         BEFORE decoding pixels (prevents decompression-bomb RAM blow-up)
+      5. Integrity verify() then decode to RGB
+
+    Use this when the caller needs actual pixel data (ML inference, thumbnailing).
+    If the caller only forwards the original bytes untouched (e.g. reverse image
+    search providers), use validate_image_header() instead — it skips the RGB
+    decode entirely, since decoding+re-encoding would waste CPU and can only
+    degrade match quality against the bytes the user actually uploaded.
+
+    Returns:
+        (PIL.Image in RGB mode, detected_mime_type)
+
+    Raises:
+        ImageValidationError: on any validation failure (use 400/413 response)
+    """
+    detected_mime, w, h, _n_frames = _validate_header(file_bytes, max_bytes, allowed_mimes, max_pixels)
+
     # --- 5. Decode to RGB ---
     try:
         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
@@ -151,6 +176,32 @@ def validate_and_load(
         )
 
     return img, detected_mime
+
+
+def validate_image_header(
+    file_bytes: bytes,
+    max_bytes: int = 20 * 1024 * 1024,
+    allowed_mimes: Optional[frozenset] = None,
+    max_pixels: int = _DEFAULT_MAX_PIXELS,
+) -> str:
+    """
+    Validate image bytes WITHOUT decoding pixels or allocating a PIL RGB image.
+
+    Same guarantees as validate_and_load() (size cap, magic bytes, mime
+    allowlist, decompression-bomb guard, corruption/truncation check) but
+    skips step 5 (RGB decode + resize). Callers that only ever forward the
+    original bytes (reverse-image-search providers, storage, hashing) should
+    use this — it avoids an unnecessary full image decode + re-encode on
+    every request.
+
+    Returns:
+        detected_mime_type
+
+    Raises:
+        ImageValidationError: on any validation failure (use 400/413 response)
+    """
+    detected_mime, _w, _h, _n_frames = _validate_header(file_bytes, max_bytes, allowed_mimes, max_pixels)
+    return detected_mime
 
 
 def sanitise_filename(filename: str) -> str:

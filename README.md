@@ -121,6 +121,43 @@ All endpoints require `X-API-Key: <your-key>` header (or `Authorization: Bearer 
 | `POST` | `/api/v1/patents/reverse-image` | Reverse image search on the web |
 | `GET` | `/api/v1/patents/usage` | API quota usage status |
 
+### Reverse Image Search (lightweight, no local ML)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/reverse-image-search` | Provider-agnostic reverse image search with cost-saving early-stop |
+| `POST` | `/api/v1/reverse-image-search/batch` | Same, for multiple images in one request (`files` multipart list and/or `image_urls` JSON list, capped at `REVERSE_SEARCH_MAX_BATCH_SIZE`). Images are independent and processed concurrently; each result includes a `source` field. Returns `207` with `{"count", "results": [...]}`. |
+
+Independent from the CLIP/SigLIP/Qdrant stack above: this endpoint only
+orchestrates external reverse-image-search APIs (Google Vision Web
+Detection, Serper Lens, optional experimental Mungfali) in priority order,
+and returns exactly:
+
+```json
+{
+  "found": true,
+  "website": "Wikipedia",
+  "url": "https://es.wikipedia.org/...",
+  "similarity": 99.0,
+  "provider": "google_vision",
+  "elapsed_ms": 412
+}
+```
+
+The chain stops the instant one provider clears its own configured
+`*_STOP_THRESHOLD` — a confident match on provider 1 never spends quota on
+providers 2/3. Identical images (by SHA-256) are served from cache without
+calling any provider at all. See `.env.example`
+(`REVERSE_SEARCH_*`, `GOOGLE_VISION_*`, `SERPER_*`, `MUNGFALI_*`) and
+`app/reverse_search/`.
+
+This module can also run as a **standalone, torch-free microservice** for
+deployments that only need reverse image search — see
+`requirements-reverse-search.txt` and `docker/Dockerfile.reverse-search` /
+`docker/docker-compose.reverse-search.yml`. It shares zero import-time
+dependency on `app.models`, `app.storage.vector_repository`, or
+`app.workers`, so torch/transformers/qdrant-client are never loaded.
+
 ### Health & Monitoring
 
 | Method | Endpoint | Auth | Description |
@@ -475,16 +512,28 @@ xplagiax/
 │   ├── security/middleware.py      # API key auth, rate limiting, error handlers
 │   ├── observability/telemetry.py  # structlog + Prometheus metrics
 │   ├── workers/ml_worker.py        # RQ job entrypoint — runs in separate process
-│   └── utils/image_validation.py  # Magic bytes, size limits, path sanitisation
+│   ├── utils/image_validation.py  # Magic bytes, size limits, path sanitisation
+│   └── reverse_search/              # Lightweight external-API reverse-image-search
+│       ├── app.py                   #   standalone create_app() — no torch/qdrant import
+│       ├── factory.py                #   DI wiring (providers + orchestrator)
+│       ├── orchestrator.py           #   early-stop chain (the cost-saving core)
+│       ├── cache.py                  #   SHA-256 keyed cache, asymmetric found/not-found TTL
+│       ├── temp_hosting.py           #   ephemeral public URL for URL-based providers
+│       ├── routes.py                 #   POST /api/v1/reverse-image-search
+│       └── providers/                #   google_vision.py, serper_lens.py, mungfali.py (stub)
 │
 ├── docker/
 │   ├── docker-compose.yml          # API + Worker, connects to external xplagiax-net
+│   ├── docker-compose.reverse-search.yml  # Standalone: reverse-search + Redis ONLY
+│   ├── Dockerfile.reverse-search   # Standalone image — no torch/transformers/qdrant-client
+│   ├── gunicorn.reverse_search.conf.py  # Gunicorn config for the standalone service
 │   ├── entrypoint.sh               # api | worker | shell mode selector
 │   ├── gunicorn.conf.py            # Production Gunicorn config (gevent, 1 worker)
 │   └── nginx.conf                  # Rate limiting, TLS, proxy config
 │
 └── tests/
-    └── test_suite.py               # 30+ unit + integration tests (fully mocked)
+    ├── test_suite.py               # 30+ unit + integration tests (fully mocked)
+    └── test_reverse_search.py      # Early-stop, cache TTL, retry-policy tests
 ```
 
 ---
@@ -691,6 +740,40 @@ Todos los endpoints requieren `X-API-Key: <tu-clave>` (o `Authorization: Bearer 
 | `GET` | `/api/v1/patents/<id>` | Obtener detalles completos de una patente |
 | `POST` | `/api/v1/patents/reverse-image` | Búsqueda inversa en la web |
 | `GET` | `/api/v1/patents/usage` | Estado de cuota de APIs externas |
+
+### Búsqueda Inversa de Imágenes (ligera, sin IA local)
+
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| `POST` | `/api/v1/reverse-image-search` | Búsqueda inversa orquestando proveedores externos con Early Stop |
+| `POST` | `/api/v1/reverse-image-search/batch` | Igual, para varias imágenes en un solo request (`files` multipart o `image_urls` JSON, tope `REVERSE_SEARCH_MAX_BATCH_SIZE`). Cada imagen es independiente y se procesa concurrentemente; cada resultado incluye `source`. Devuelve `207` con `{"count", "results": [...]}`. |
+
+Independiente del stack CLIP/SigLIP/Qdrant: este endpoint solo orquesta APIs
+externas de reverse image search (Google Vision Web Detection, Serper Lens,
+Mungfali experimental) en orden de prioridad y devuelve exactamente:
+
+```json
+{
+  "found": true,
+  "website": "Wikipedia",
+  "url": "https://es.wikipedia.org/...",
+  "similarity": 99.0,
+  "provider": "google_vision",
+  "elapsed_ms": 412
+}
+```
+
+La cadena se detiene apenas un proveedor supera su propio
+`*_STOP_THRESHOLD` configurado — una coincidencia confiable en el proveedor
+1 nunca consume cuota de los proveedores 2/3. Imágenes idénticas (por
+SHA-256) se sirven desde cache sin llamar a ningún proveedor. Ver
+`.env.example` (`REVERSE_SEARCH_*`, `GOOGLE_VISION_*`, `SERPER_*`,
+`MUNGFALI_*`) y `app/reverse_search/`.
+
+Este módulo también puede correr como **microservicio standalone sin
+torch**, para despliegues que solo necesitan reverse image search — ver
+`requirements-reverse-search.txt` y `docker/Dockerfile.reverse-search` /
+`docker/docker-compose.reverse-search.yml`.
 
 ---
 
@@ -955,16 +1038,28 @@ xplagiax/
 │   ├── security/middleware.py      # Auth, rate limiting, error handlers
 │   ├── observability/telemetry.py  # structlog + métricas Prometheus
 │   ├── workers/ml_worker.py        # Entrypoint del worker RQ
-│   └── utils/image_validation.py  # Magic bytes, límites de tamaño, sanitización
+│   ├── utils/image_validation.py  # Magic bytes, límites de tamaño, sanitización
+│   └── reverse_search/              # Reverse image search ligero (sin IA local)
+│       ├── app.py                   #   create_app() standalone — sin import de torch/qdrant
+│       ├── factory.py                #   wiring de proveedores + orquestador
+│       ├── orchestrator.py           #   cadena Early Stop (el núcleo de ahorro de costo)
+│       ├── cache.py                  #   cache por SHA-256, TTL asimétrico found/not-found
+│       ├── temp_hosting.py           #   URL pública efímera para proveedores basados en URL
+│       ├── routes.py                 #   POST /api/v1/reverse-image-search
+│       └── providers/                #   google_vision.py, serper_lens.py, mungfali.py (stub)
 │
 ├── docker/
 │   ├── docker-compose.yml          # API + Worker conectados a xplagiax-net externa
+│   ├── docker-compose.reverse-search.yml  # Standalone: reverse-search + Redis solamente
+│   ├── Dockerfile.reverse-search   # Imagen standalone — sin torch/transformers/qdrant-client
+│   ├── gunicorn.reverse_search.conf.py  # Config Gunicorn del servicio standalone
 │   ├── entrypoint.sh               # Selector de modo: api | worker | shell
 │   ├── gunicorn.conf.py            # Config Gunicorn producción
 │   └── nginx.conf                  # Rate limiting, TLS, proxy
 │
 └── tests/
-    └── test_suite.py               # 30+ tests unitarios e integración
+    ├── test_suite.py               # 30+ tests unitarios e integración
+    └── test_reverse_search.py      # Tests de Early Stop, TTL de cache y política de retry
 ```
 
 ---

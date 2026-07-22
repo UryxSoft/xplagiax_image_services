@@ -1,0 +1,40 @@
+# ============================================================
+# requirements-reverse-search.txt
+#
+# Dependencies for the STANDALONE reverse-image-search microservice
+# (app.reverse_search.app:create_app). Deliberately does NOT include torch,
+# transformers, sentence-transformers, accelerate, qdrant-client, imagehash
+# or opentelemetry — this process never imports app.models.registry or
+# app.storage.vector_repository, so none of that is ever loaded into RAM.
+#
+# Run: pip install -r requirements-reverse-search.txt
+# ============================================================
+
+# Web framework
+flask==3.0.3
+gunicorn==22.0.0
+gevent==24.2.1          # I/O-bound workload (see docker/gunicorn.reverse_search.conf.py);
+                        # also used directly to fan out /reverse-image-search/batch
+
+# Image validation only (magic bytes + decompression-bomb guard). No ML
+# decode path — pixels are never touched, only the header is inspected.
+Pillow==10.4.0
+
+# SHA-256 result cache + ephemeral temp-hosting for URL-based providers
+redis==5.0.8
+
+# HTTP client for calling external reverse-image-search providers
+requests==2.32.3
+
+# Observability
+structlog==24.4.0
+prometheus-client==0.20.0
+
+# Type annotations (stdlib in 3.11+, shim for 3.9/3.10)
+typing_extensions==4.12.2
+
+# ============================================================
+# Development / testing only (not installed in production)
+# ============================================================
+# pytest==8.2.2
+# pytest-mock==3.14.0

@@ -187,6 +187,37 @@ class ObservabilityConfig:
 
 
 @dataclass(frozen=True)
+class ProviderSettings:
+    """Per-provider tuning for the reverse-image-search early-stop chain."""
+    enabled: bool
+    priority: int              # lower = tried first
+    stop_threshold: float      # similarity (0-100) at/above which we stop immediately
+    timeout_s: float           # connect+read timeout for this provider's HTTP call
+    requires_public_url: bool  # True if the provider needs a fetchable image URL (vs inline bytes)
+
+
+@dataclass(frozen=True)
+class ReverseSearchConfig:
+    enabled: bool
+    max_providers: int
+    max_retries: int
+    max_batch_size: int          # cap on items per /reverse-image-search/batch request
+    cache_ttl_found: int         # seconds — a discovered copy rarely un-appears
+    cache_ttl_not_found: int     # seconds — much shorter: absence can change as the web index grows
+    public_base_url: Optional[str]  # this service's own public URL, for URL-based providers
+    temp_hosting_ttl: int            # seconds an uploaded image stays servable at a temp public URL
+
+    google_vision_api_key: Optional[str]
+    google_vision: ProviderSettings
+
+    serper_api_key: Optional[str]
+    serper: ProviderSettings
+
+    mungfali_api_key: Optional[str]
+    mungfali: ProviderSettings
+
+
+@dataclass(frozen=True)
 class AppConfig:
     qdrant: QdrantConfig
     redis: RedisConfig
@@ -195,6 +226,7 @@ class AppConfig:
     security: SecurityConfig
     storage: StorageConfig
     observability: ObservabilityConfig
+    reverse_search: ReverseSearchConfig
     debug: bool
     workers: int
 
@@ -332,6 +364,57 @@ def load_config() -> AppConfig:
         seaweedfs_public_volume_url=_optional("SEAWEEDFS_PUBLIC_VOLUME_URL") or None,
     )
 
+    # Reverse-image-search — lightweight external-API orchestrator (no local ML).
+    # Secrets read from env ONLY, same convention as serpapi_key/zenserp_key above.
+    google_vision_api_key = _optional("GOOGLE_VISION_API_KEY") or None
+    serper_api_key = _optional("SERPER_API_KEY") or None
+    mungfali_api_key = _optional("MUNGFALI_API_KEY") or None
+
+    reverse_search = ReverseSearchConfig(
+        enabled=_optional_bool("REVERSE_SEARCH_ENABLED", True),
+        max_providers=_optional_int("REVERSE_SEARCH_MAX_PROVIDERS", 3),
+        max_retries=_optional_int("REVERSE_SEARCH_MAX_RETRIES", 2),
+        max_batch_size=_optional_int("REVERSE_SEARCH_MAX_BATCH_SIZE", 20),
+        cache_ttl_found=_optional_int("REVERSE_SEARCH_CACHE_TTL_FOUND", 30 * 86_400),
+        cache_ttl_not_found=_optional_int("REVERSE_SEARCH_CACHE_TTL_NOT_FOUND", 86_400),
+        public_base_url=_optional("REVERSE_SEARCH_PUBLIC_BASE_URL") or None,
+        temp_hosting_ttl=_optional_int("REVERSE_SEARCH_TEMP_HOSTING_TTL", 120),
+        google_vision_api_key=google_vision_api_key,
+        google_vision=ProviderSettings(
+            enabled=_optional_bool("GOOGLE_VISION_ENABLED", True),
+            priority=_optional_int("GOOGLE_VISION_PRIORITY", 1),
+            stop_threshold=_optional_float("GOOGLE_VISION_STOP_THRESHOLD", 98.0),
+            timeout_s=_optional_float("GOOGLE_VISION_TIMEOUT", 5.0),
+            requires_public_url=False,  # sends image bytes inline (base64) — no temp hosting needed
+        ),
+        serper_api_key=serper_api_key,
+        serper=ProviderSettings(
+            enabled=_optional_bool("SERPER_ENABLED", True),
+            priority=_optional_int("SERPER_PRIORITY", 2),
+            stop_threshold=_optional_float("SERPER_STOP_THRESHOLD", 95.0),
+            timeout_s=_optional_float("SERPER_TIMEOUT", 6.0),
+            requires_public_url=True,  # google.serper.dev/lens fetches the image itself from a URL
+        ),
+        mungfali_api_key=mungfali_api_key,
+        mungfali=ProviderSettings(
+            # Disabled by default: Mungfali's public docs describe a keyword/stock
+            # image search product. We could not verify an image-upload reverse-
+            # search contract, so this adapter is a template — enable only after
+            # confirming the real endpoint with the vendor (see providers/mungfali.py).
+            enabled=_optional_bool("MUNGFALI_ENABLED", False),
+            priority=_optional_int("MUNGFALI_PRIORITY", 3),
+            stop_threshold=_optional_float("MUNGFALI_STOP_THRESHOLD", 90.0),
+            timeout_s=_optional_float("MUNGFALI_TIMEOUT", 5.0),
+            requires_public_url=True,
+        ),
+    )
+    if reverse_search.enabled and not (google_vision_api_key or serper_api_key or mungfali_api_key):
+        logger.warning(
+            "REVERSE_SEARCH_ENABLED=true but no provider API key is set "
+            "(GOOGLE_VISION_API_KEY / SERPER_API_KEY / MUNGFALI_API_KEY) — "
+            "reverse image search will be unavailable"
+        )
+
     obs = ObservabilityConfig(
         log_level=_optional("LOG_LEVEL", "INFO").upper(),
         log_format=_optional("LOG_FORMAT", "json"),
@@ -351,6 +434,7 @@ def load_config() -> AppConfig:
         security=security,
         storage=storage,
         observability=obs,
+        reverse_search=reverse_search,
         debug=_optional_bool("FLASK_DEBUG", False),
         workers=_optional_int("WORKER_PROCESSES", 1),
     )

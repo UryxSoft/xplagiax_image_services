@@ -1,0 +1,23 @@
+Cambios.tar.gz — reverse-image-search microservice
+====================================================
+
+Contenido:
+  - Los 24 archivos nuevos/modificados (misma ruta relativa que en el repo),
+    listos para copiar directo sobre tu clon local de xplagiax_image_services.
+  - CAMBIOS.patch — el mismo cambio como diff unificado, por si prefieres
+    aplicarlo con `git apply CAMBIOS.patch` o `patch -p1 < CAMBIOS.patch`
+    desde la raíz del repo.
+
+Incluye 2 commits locales (firmados, sin publicar por el bloqueo de permisos
+de la integración de GitHub en esta sesión):
+  e074d74  Add lightweight reverse-image-search microservice (no local ML)
+  841a660  Add batch endpoint for reverse-image-search
+    -> POST /api/v1/reverse-image-search/batch (multi-imagen, concurrente
+       entre imagenes, secuencial por proveedor dentro de cada una)
+
+Para aplicar los archivos sueltos:
+  tar xzf Cambios.tar.gz -C /ruta/a/tu/clon/xplagiax_image_services
+
+Para aplicar el patch en su lugar:
+  cd /ruta/a/tu/clon/xplagiax_image_services
+  git apply CAMBIOS.patch

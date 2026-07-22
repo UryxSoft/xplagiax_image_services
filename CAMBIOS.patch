@@ -1,0 +1,2676 @@
+diff --git a/.env.example b/.env.example
+index fa20970..cc7f863 100644
+--- a/.env.example
++++ b/.env.example
+@@ -86,6 +86,68 @@ ZENSERP_MONTHLY_LIMIT=50
+ API_CIRCUIT_FAILURE_THRESHOLD=5
+ API_CIRCUIT_RECOVERY_S=120
+ 
++# ==============================================================================
++# Reverse Image Search — lightweight external-API orchestrator (no local ML)
++#
++# Providers are tried in ascending PRIORITY order. As soon as one returns a
++# similarity >= its own STOP_THRESHOLD, the chain stops immediately — no
++# further providers are called, no further quota is spent. If none clears
++# its threshold, the best result found across all tried providers is
++# returned. See app/reverse_search/orchestrator.py.
++#
++# Deployable two ways:
++#   1. Bundled in this monolith (app.factory:create_app) — shares this
++#      process's RAM with CLIP/SigLIP/Qdrant regardless of use.
++#   2. Standalone (app.reverse_search.app:create_app) — a genuinely separate,
++#      torch-free process. See requirements-reverse-search.txt and
++#      docker/Dockerfile.reverse-search / docker-compose.reverse-search.yml.
++# ==============================================================================
++REVERSE_SEARCH_ENABLED=true
++REVERSE_SEARCH_MAX_PROVIDERS=3
++REVERSE_SEARCH_MAX_RETRIES=2
++# Cap on images per POST /api/v1/reverse-image-search/batch request
++REVERSE_SEARCH_MAX_BATCH_SIZE=20
++# Asymmetric cache TTLs (seconds): a discovered copy rarely un-appears, but
++# "not found today" can flip to "found" as provider indexes grow.
++REVERSE_SEARCH_CACHE_TTL_FOUND=2592000      # 30 days
++REVERSE_SEARCH_CACHE_TTL_NOT_FOUND=86400    # 1 day
++# Required ONLY if a URL-based provider (Serper) is enabled — this service's
++# own public URL, used to hand providers a fetchable link to the upload for
++# the few seconds their crawler needs it.
++REVERSE_SEARCH_PUBLIC_BASE_URL=
++REVERSE_SEARCH_TEMP_HOSTING_TTL=120
++
++# Google Vision API — WEB_DETECTION feature. Sends image bytes inline
++# (base64), so no public URL is needed — this is why it is priority 1 by
++# default: the common case never pays the temp-hosting cost at all.
++GOOGLE_VISION_API_KEY=
++GOOGLE_VISION_ENABLED=true
++GOOGLE_VISION_PRIORITY=1
++GOOGLE_VISION_STOP_THRESHOLD=98
++GOOGLE_VISION_TIMEOUT=5
++
++# Serper.dev — Google Lens endpoint (google.serper.dev/lens). NOTE: this is
++# NOT the same as Serper's plain /search endpoint (text web search — cannot
++# do reverse image lookup), and Serper.dev is NOT the same company as
++# SerpApi.com (already used by SERPAPI_KEY above for patent search). Needs a
++# public image URL, hence lower priority than Google Vision.
++SERPER_API_KEY=
++SERPER_ENABLED=true
++SERPER_PRIORITY=2
++SERPER_STOP_THRESHOLD=95
++SERPER_TIMEOUT=6
++
++# Mungfali — EXPERIMENTAL / disabled by default. Its documented public API is
++# a keyword/stock image search product, not a verified image-upload reverse-
++# search endpoint. This adapter is a structurally-complete template that
++# always raises ProviderUnavailableError (safely skipped) until the real
++# contract is confirmed with the vendor. See app/reverse_search/providers/mungfali.py.
++MUNGFALI_API_KEY=
++MUNGFALI_ENABLED=false
++MUNGFALI_PRIORITY=3
++MUNGFALI_STOP_THRESHOLD=90
++MUNGFALI_TIMEOUT=5
++
+ # ==============================================================================
+ # Observability
+ # ==============================================================================
+diff --git a/AUDIT_REPORT.md b/AUDIT_REPORT.md
+index 375df61..a94468f 100644
+--- a/AUDIT_REPORT.md
++++ b/AUDIT_REPORT.md
+@@ -136,3 +136,79 @@ dependencias (SCA) en CI.*
+ # Suite de pruebas (71 tests): lógica pura + integración Flask (deps ML mockeadas)
+ python -m unittest tests.test_suite -v
+ ```
++
++---
++
++## 8. Módulo `reverse_search` — orquestador ligero de reverse image search (nuevo)
++
++Requisito de negocio: un endpoint cuya única responsabilidad sea reverse
++image search vía APIs externas, sin ningún modelo local (sin CLIP/YOLO/
++ResNet/embeddings/GPU), con **Early Stop** configurable para minimizar
++llamadas pagadas, y una respuesta reducida a 6 campos
++(`found, website, url, similarity, provider, elapsed_ms`).
++
++### 8.1 Decisión de alcance
++
++El repo ya contiene un sistema de producción con CLIP/SigLIP/Qdrant/
++SeaweedFS/RQ — exactamente lo opuesto de "ligero, sin IA local". Dado que
++el requisito no pedía eliminar detección-IA/plagio/similitud (features
++existentes, auditadas, con 74 tests), se optó por **no tocarlas**. En su
++lugar: `app/reverse_search/` es un paquete nuevo, autocontenido, sin
++dependencia de import de `app.models`, `app.storage.vector_repository` ni
++`app.workers` — deployable de dos formas:
++
++1. Integrado en el monolito (`app.factory:create_app`, ya cableado).
++2. **Standalone**, como proceso propio sin torch/transformers/qdrant-client
++   (`app.reverse_search.app:create_app`, `requirements-reverse-search.txt`,
++   `docker/Dockerfile.reverse-search`, `docker/docker-compose.reverse-search.yml`).
++
++### 8.2 Correcciones sobre los proveedores propuestos
++
++| # | Hallazgo | Corrección |
++|---|----------|------------|
++| RS1 | "Serper" (serper.dev) se confundió con "SerpApi" (serpapi.com, ya usado por `SERPAPI_KEY`) — son empresas distintas | Adaptador `serper_lens.py` apunta a `google.serper.dev/lens`, no a `/search` (búsqueda de texto, no reverse image) |
++| RS2 | Google Custom Search (Programmable Search Engine) es búsqueda de imágenes por palabra clave, **no** reverse image search — no existe parámetro de "subir imagen" en esa API | No se implementó como proveedor de reverse search; se usa **Google Vision API (`WEB_DETECTION`)**, que sí es la herramienta correcta de Google para esto |
++| RS3 | Mungfali: su documentación pública describe un producto de búsqueda de imágenes por keyword, sin contrato verificado de "sube esta imagen, dime dónde salió" | `providers/mungfali.py` es una plantilla que implementa el contrato `ReverseSearchProvider` pero siempre lanza `ProviderUnavailableError` (el orquestador la trata como "proveedor caído" y sigue) — `MUNGFALI_ENABLED=false` por defecto |
++| RS4 | API keys de Serper/Mungfali pegadas en texto plano en la conversación | Nunca escritas en el repo (solo placeholders vacíos en `.env.example`); se recomendó rotarlas |
++
++### 8.3 Diseño Early Stop + Cache
++
++- Proveedores ordenados por `*_PRIORITY`; se detiene en el primero cuyo
++  resultado supere su propio `*_STOP_THRESHOLD` (todo configurable por env).
++- Google Vision (bytes inline, sin URL pública) es prioridad 1 por defecto:
++  el caso común nunca paga el costo de exponer la imagen públicamente.
++- SHA-256 calculado **una sola vez** por request (`orchestrator.search()`),
++  reusado como clave de cache — nunca se re-lee ni re-hashea la imagen.
++- Cache con TTL asimétrico: resultados positivos (30d por defecto) duran
++  mucho más que los negativos (1d) — una copia encontrada rara vez
++  desaparece, pero "no encontrado hoy" puede cambiar cuando el índice del
++  proveedor crece.
++- Retry solo en 429/500/502/503/504 (respeta `Retry-After`), nunca en
++  401/403/404 — política única en `providers/base.py::retry_call`.
++
++### 8.4 Concurrencia
++
++`requests.Session` (pooled, keep-alive) en vez de asyncio/aiohttp/ThreadPool/
++ProcessPool: la cadena Early Stop es intrínsecamente secuencial (llamar,
++evaluar, decidir si continuar), así que no hay nada que paralelizar dentro
++de un request sin romper el objetivo de ahorro de cuota. La concurrencia
++entre requests de clientes la da Gunicorn+gevent (ya usado en este repo),
++que hace cooperativas las llamadas HTTP sin escribir async/await.
++
++### 8.5 Batch (`POST /api/v1/reverse-image-search/batch`)
++
++Añadido a pedido: múltiples imágenes en un solo request (`files` multipart y/o
++`image_urls`), tope configurable (`REVERSE_SEARCH_MAX_BATCH_SIZE`, 20 por
++defecto). Cada imagen es independiente (su propio SHA-256, cache y cadena
++Early Stop), así que se procesan **concurrentemente** con `gevent.spawn` +
++`joinall` — a diferencia de la cadena de proveedores dentro de una misma
++imagen, que sigue siendo secuencial porque de eso depende el ahorro de Early
++Stop. El `requests.Session` compartido ya era usado concurrentemente entre
++requests de distintos clientes bajo el worker gevent; esto extiende la misma
++propiedad dentro de un solo request.
++
++### 8.6 Verificación
++
++```bash
++python -m unittest tests.test_reverse_search -v   # 21 tests
++```
+diff --git a/README.md b/README.md
+index 11e4408..07c71c3 100644
+--- a/README.md
++++ b/README.md
+@@ -121,6 +121,43 @@ All endpoints require `X-API-Key: <your-key>` header (or `Authorization: Bearer
+ | `POST` | `/api/v1/patents/reverse-image` | Reverse image search on the web |
+ | `GET` | `/api/v1/patents/usage` | API quota usage status |
+ 
++### Reverse Image Search (lightweight, no local ML)
++
++| Method | Endpoint | Description |
++|--------|----------|-------------|
++| `POST` | `/api/v1/reverse-image-search` | Provider-agnostic reverse image search with cost-saving early-stop |
++| `POST` | `/api/v1/reverse-image-search/batch` | Same, for multiple images in one request (`files` multipart list and/or `image_urls` JSON list, capped at `REVERSE_SEARCH_MAX_BATCH_SIZE`). Images are independent and processed concurrently; each result includes a `source` field. Returns `207` with `{"count", "results": [...]}`. |
++
++Independent from the CLIP/SigLIP/Qdrant stack above: this endpoint only
++orchestrates external reverse-image-search APIs (Google Vision Web
++Detection, Serper Lens, optional experimental Mungfali) in priority order,
++and returns exactly:
++
++```json
++{
++  "found": true,
++  "website": "Wikipedia",
++  "url": "https://es.wikipedia.org/...",
++  "similarity": 99.0,
++  "provider": "google_vision",
++  "elapsed_ms": 412
++}
++```
++
++The chain stops the instant one provider clears its own configured
++`*_STOP_THRESHOLD` — a confident match on provider 1 never spends quota on
++providers 2/3. Identical images (by SHA-256) are served from cache without
++calling any provider at all. See `.env.example`
++(`REVERSE_SEARCH_*`, `GOOGLE_VISION_*`, `SERPER_*`, `MUNGFALI_*`) and
++`app/reverse_search/`.
++
++This module can also run as a **standalone, torch-free microservice** for
++deployments that only need reverse image search — see
++`requirements-reverse-search.txt` and `docker/Dockerfile.reverse-search` /
++`docker/docker-compose.reverse-search.yml`. It shares zero import-time
++dependency on `app.models`, `app.storage.vector_repository`, or
++`app.workers`, so torch/transformers/qdrant-client are never loaded.
++
+ ### Health & Monitoring
+ 
+ | Method | Endpoint | Auth | Description |
+@@ -475,16 +512,28 @@ xplagiax/
+ │   ├── security/middleware.py      # API key auth, rate limiting, error handlers
+ │   ├── observability/telemetry.py  # structlog + Prometheus metrics
+ │   ├── workers/ml_worker.py        # RQ job entrypoint — runs in separate process
+-│   └── utils/image_validation.py  # Magic bytes, size limits, path sanitisation
++│   ├── utils/image_validation.py  # Magic bytes, size limits, path sanitisation
++│   └── reverse_search/              # Lightweight external-API reverse-image-search
++│       ├── app.py                   #   standalone create_app() — no torch/qdrant import
++│       ├── factory.py                #   DI wiring (providers + orchestrator)
++│       ├── orchestrator.py           #   early-stop chain (the cost-saving core)
++│       ├── cache.py                  #   SHA-256 keyed cache, asymmetric found/not-found TTL
++│       ├── temp_hosting.py           #   ephemeral public URL for URL-based providers
++│       ├── routes.py                 #   POST /api/v1/reverse-image-search
++│       └── providers/                #   google_vision.py, serper_lens.py, mungfali.py (stub)
+ │
+ ├── docker/
+ │   ├── docker-compose.yml          # API + Worker, connects to external xplagiax-net
++│   ├── docker-compose.reverse-search.yml  # Standalone: reverse-search + Redis ONLY
++│   ├── Dockerfile.reverse-search   # Standalone image — no torch/transformers/qdrant-client
++│   ├── gunicorn.reverse_search.conf.py  # Gunicorn config for the standalone service
+ │   ├── entrypoint.sh               # api | worker | shell mode selector
+ │   ├── gunicorn.conf.py            # Production Gunicorn config (gevent, 1 worker)
+ │   └── nginx.conf                  # Rate limiting, TLS, proxy config
+ │
+ └── tests/
+-    └── test_suite.py               # 30+ unit + integration tests (fully mocked)
++    ├── test_suite.py               # 30+ unit + integration tests (fully mocked)
++    └── test_reverse_search.py      # Early-stop, cache TTL, retry-policy tests
+ ```
+ 
+ ---
+@@ -692,6 +741,40 @@ Todos los endpoints requieren `X-API-Key: <tu-clave>` (o `Authorization: Bearer
+ | `POST` | `/api/v1/patents/reverse-image` | Búsqueda inversa en la web |
+ | `GET` | `/api/v1/patents/usage` | Estado de cuota de APIs externas |
+ 
++### Búsqueda Inversa de Imágenes (ligera, sin IA local)
++
++| Método | Endpoint | Descripción |
++|--------|----------|-------------|
++| `POST` | `/api/v1/reverse-image-search` | Búsqueda inversa orquestando proveedores externos con Early Stop |
++| `POST` | `/api/v1/reverse-image-search/batch` | Igual, para varias imágenes en un solo request (`files` multipart o `image_urls` JSON, tope `REVERSE_SEARCH_MAX_BATCH_SIZE`). Cada imagen es independiente y se procesa concurrentemente; cada resultado incluye `source`. Devuelve `207` con `{"count", "results": [...]}`. |
++
++Independiente del stack CLIP/SigLIP/Qdrant: este endpoint solo orquesta APIs
++externas de reverse image search (Google Vision Web Detection, Serper Lens,
++Mungfali experimental) en orden de prioridad y devuelve exactamente:
++
++```json
++{
++  "found": true,
++  "website": "Wikipedia",
++  "url": "https://es.wikipedia.org/...",
++  "similarity": 99.0,
++  "provider": "google_vision",
++  "elapsed_ms": 412
++}
++```
++
++La cadena se detiene apenas un proveedor supera su propio
++`*_STOP_THRESHOLD` configurado — una coincidencia confiable en el proveedor
++1 nunca consume cuota de los proveedores 2/3. Imágenes idénticas (por
++SHA-256) se sirven desde cache sin llamar a ningún proveedor. Ver
++`.env.example` (`REVERSE_SEARCH_*`, `GOOGLE_VISION_*`, `SERPER_*`,
++`MUNGFALI_*`) y `app/reverse_search/`.
++
++Este módulo también puede correr como **microservicio standalone sin
++torch**, para despliegues que solo necesitan reverse image search — ver
++`requirements-reverse-search.txt` y `docker/Dockerfile.reverse-search` /
++`docker/docker-compose.reverse-search.yml`.
++
+ ---
+ 
+ ## Umbrales de Similitud
+@@ -955,16 +1038,28 @@ xplagiax/
+ │   ├── security/middleware.py      # Auth, rate limiting, error handlers
+ │   ├── observability/telemetry.py  # structlog + métricas Prometheus
+ │   ├── workers/ml_worker.py        # Entrypoint del worker RQ
+-│   └── utils/image_validation.py  # Magic bytes, límites de tamaño, sanitización
++│   ├── utils/image_validation.py  # Magic bytes, límites de tamaño, sanitización
++│   └── reverse_search/              # Reverse image search ligero (sin IA local)
++│       ├── app.py                   #   create_app() standalone — sin import de torch/qdrant
++│       ├── factory.py                #   wiring de proveedores + orquestador
++│       ├── orchestrator.py           #   cadena Early Stop (el núcleo de ahorro de costo)
++│       ├── cache.py                  #   cache por SHA-256, TTL asimétrico found/not-found
++│       ├── temp_hosting.py           #   URL pública efímera para proveedores basados en URL
++│       ├── routes.py                 #   POST /api/v1/reverse-image-search
++│       └── providers/                #   google_vision.py, serper_lens.py, mungfali.py (stub)
+ │
+ ├── docker/
+ │   ├── docker-compose.yml          # API + Worker conectados a xplagiax-net externa
++│   ├── docker-compose.reverse-search.yml  # Standalone: reverse-search + Redis solamente
++│   ├── Dockerfile.reverse-search   # Imagen standalone — sin torch/transformers/qdrant-client
++│   ├── gunicorn.reverse_search.conf.py  # Config Gunicorn del servicio standalone
+ │   ├── entrypoint.sh               # Selector de modo: api | worker | shell
+ │   ├── gunicorn.conf.py            # Config Gunicorn producción
+ │   └── nginx.conf                  # Rate limiting, TLS, proxy
+ │
+ └── tests/
+-    └── test_suite.py               # 30+ tests unitarios e integración
++    ├── test_suite.py               # 30+ tests unitarios e integración
++    └── test_reverse_search.py      # Tests de Early Stop, TTL de cache y política de retry
+ ```
+ 
+ ---
+diff --git a/app/config.py b/app/config.py
+index 6f0ba7f..498bc04 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -186,6 +186,37 @@ class ObservabilityConfig:
+     environment: str
+ 
+ 
++@dataclass(frozen=True)
++class ProviderSettings:
++    """Per-provider tuning for the reverse-image-search early-stop chain."""
++    enabled: bool
++    priority: int              # lower = tried first
++    stop_threshold: float      # similarity (0-100) at/above which we stop immediately
++    timeout_s: float           # connect+read timeout for this provider's HTTP call
++    requires_public_url: bool  # True if the provider needs a fetchable image URL (vs inline bytes)
++
++
++@dataclass(frozen=True)
++class ReverseSearchConfig:
++    enabled: bool
++    max_providers: int
++    max_retries: int
++    max_batch_size: int          # cap on items per /reverse-image-search/batch request
++    cache_ttl_found: int         # seconds — a discovered copy rarely un-appears
++    cache_ttl_not_found: int     # seconds — much shorter: absence can change as the web index grows
++    public_base_url: Optional[str]  # this service's own public URL, for URL-based providers
++    temp_hosting_ttl: int            # seconds an uploaded image stays servable at a temp public URL
++
++    google_vision_api_key: Optional[str]
++    google_vision: ProviderSettings
++
++    serper_api_key: Optional[str]
++    serper: ProviderSettings
++
++    mungfali_api_key: Optional[str]
++    mungfali: ProviderSettings
++
++
+ @dataclass(frozen=True)
+ class AppConfig:
+     qdrant: QdrantConfig
+@@ -195,6 +226,7 @@ class AppConfig:
+     security: SecurityConfig
+     storage: StorageConfig
+     observability: ObservabilityConfig
++    reverse_search: ReverseSearchConfig
+     debug: bool
+     workers: int
+ 
+@@ -332,6 +364,57 @@ def load_config() -> AppConfig:
+         seaweedfs_public_volume_url=_optional("SEAWEEDFS_PUBLIC_VOLUME_URL") or None,
+     )
+ 
++    # Reverse-image-search — lightweight external-API orchestrator (no local ML).
++    # Secrets read from env ONLY, same convention as serpapi_key/zenserp_key above.
++    google_vision_api_key = _optional("GOOGLE_VISION_API_KEY") or None
++    serper_api_key = _optional("SERPER_API_KEY") or None
++    mungfali_api_key = _optional("MUNGFALI_API_KEY") or None
++
++    reverse_search = ReverseSearchConfig(
++        enabled=_optional_bool("REVERSE_SEARCH_ENABLED", True),
++        max_providers=_optional_int("REVERSE_SEARCH_MAX_PROVIDERS", 3),
++        max_retries=_optional_int("REVERSE_SEARCH_MAX_RETRIES", 2),
++        max_batch_size=_optional_int("REVERSE_SEARCH_MAX_BATCH_SIZE", 20),
++        cache_ttl_found=_optional_int("REVERSE_SEARCH_CACHE_TTL_FOUND", 30 * 86_400),
++        cache_ttl_not_found=_optional_int("REVERSE_SEARCH_CACHE_TTL_NOT_FOUND", 86_400),
++        public_base_url=_optional("REVERSE_SEARCH_PUBLIC_BASE_URL") or None,
++        temp_hosting_ttl=_optional_int("REVERSE_SEARCH_TEMP_HOSTING_TTL", 120),
++        google_vision_api_key=google_vision_api_key,
++        google_vision=ProviderSettings(
++            enabled=_optional_bool("GOOGLE_VISION_ENABLED", True),
++            priority=_optional_int("GOOGLE_VISION_PRIORITY", 1),
++            stop_threshold=_optional_float("GOOGLE_VISION_STOP_THRESHOLD", 98.0),
++            timeout_s=_optional_float("GOOGLE_VISION_TIMEOUT", 5.0),
++            requires_public_url=False,  # sends image bytes inline (base64) — no temp hosting needed
++        ),
++        serper_api_key=serper_api_key,
++        serper=ProviderSettings(
++            enabled=_optional_bool("SERPER_ENABLED", True),
++            priority=_optional_int("SERPER_PRIORITY", 2),
++            stop_threshold=_optional_float("SERPER_STOP_THRESHOLD", 95.0),
++            timeout_s=_optional_float("SERPER_TIMEOUT", 6.0),
++            requires_public_url=True,  # google.serper.dev/lens fetches the image itself from a URL
++        ),
++        mungfali_api_key=mungfali_api_key,
++        mungfali=ProviderSettings(
++            # Disabled by default: Mungfali's public docs describe a keyword/stock
++            # image search product. We could not verify an image-upload reverse-
++            # search contract, so this adapter is a template — enable only after
++            # confirming the real endpoint with the vendor (see providers/mungfali.py).
++            enabled=_optional_bool("MUNGFALI_ENABLED", False),
++            priority=_optional_int("MUNGFALI_PRIORITY", 3),
++            stop_threshold=_optional_float("MUNGFALI_STOP_THRESHOLD", 90.0),
++            timeout_s=_optional_float("MUNGFALI_TIMEOUT", 5.0),
++            requires_public_url=True,
++        ),
++    )
++    if reverse_search.enabled and not (google_vision_api_key or serper_api_key or mungfali_api_key):
++        logger.warning(
++            "REVERSE_SEARCH_ENABLED=true but no provider API key is set "
++            "(GOOGLE_VISION_API_KEY / SERPER_API_KEY / MUNGFALI_API_KEY) — "
++            "reverse image search will be unavailable"
++        )
++
+     obs = ObservabilityConfig(
+         log_level=_optional("LOG_LEVEL", "INFO").upper(),
+         log_format=_optional("LOG_FORMAT", "json"),
+@@ -351,6 +434,7 @@ def load_config() -> AppConfig:
+         security=security,
+         storage=storage,
+         observability=obs,
++        reverse_search=reverse_search,
+         debug=_optional_bool("FLASK_DEBUG", False),
+         workers=_optional_int("WORKER_PROCESSES", 1),
+     )
+diff --git a/app/factory.py b/app/factory.py
+index 6b0f794..7e5ac14 100644
+--- a/app/factory.py
++++ b/app/factory.py
+@@ -219,6 +219,17 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
+     api_rotator = _build_api_rotator(config, cache, raw_redis)
+     app.extensions["xplagiax_api_rotator"] = api_rotator
+ 
++    # ------------------------------------------------------------------ #
++    # 9b. Reverse Image Search — lightweight external-API orchestrator   #
++    #     (independent of the CLIP/SigLIP/Qdrant stack above; see        #
++    #     app/reverse_search/. Also deployable standalone via            #
++    #     app.reverse_search.app:create_app for a torch-free process.)   #
++    # ------------------------------------------------------------------ #
++    from app.reverse_search.factory import build_reverse_search_orchestrator
++    reverse_search_orchestrator = build_reverse_search_orchestrator(config.reverse_search, cache)
++    app.extensions["xplagiax_reverse_search_orchestrator"] = reverse_search_orchestrator
++    app.extensions["xplagiax_reverse_search_config"] = config.reverse_search
++
+     # ------------------------------------------------------------------ #
+     # 10. Security config (available to decorators via extensions)       #
+     # ------------------------------------------------------------------ #
+@@ -236,7 +247,8 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
+         patents_bp,
+         search_bp,
+     )
+-    for bp in (health_bp, images_bp, search_bp, patents_bp, admin_bp, jobs_bp):
++    from app.reverse_search.routes import reverse_search_bp
++    for bp in (health_bp, images_bp, search_bp, patents_bp, admin_bp, jobs_bp, reverse_search_bp):
+         app.register_blueprint(bp)
+ 
+     # ------------------------------------------------------------------ #
+@@ -266,6 +278,7 @@ def create_app(config: Optional[AppConfig] = None) -> Flask:
+             "/api/v1/images", "/api/v1/search/similar",
+             "/api/v1/search/plagiarism", "/api/v1/search/ai-detection",
+             "/api/v1/patents/search/image", "/api/v1/admin/collection/items",
++            "/api/v1/reverse-image-search",
+         ],
+     )
+     return app
+diff --git a/app/reverse_search/__init__.py b/app/reverse_search/__init__.py
+new file mode 100644
+index 0000000..c9ccb04
+--- /dev/null
++++ b/app/reverse_search/__init__.py
+@@ -0,0 +1 @@
++# reverse_search package — lightweight external-API reverse-image-search orchestrator.
+diff --git a/app/reverse_search/app.py b/app/reverse_search/app.py
+new file mode 100644
+index 0000000..e290254
+--- /dev/null
++++ b/app/reverse_search/app.py
+@@ -0,0 +1,112 @@
++"""
++Standalone entrypoint for the reverse-image-search microservice.
++
++This factory wires ONLY what this feature needs: config, structured logging
+++ Prometheus metrics, Redis cache, security middleware (auth/rate-limit), and
++the reverse-search blueprint. It deliberately never imports
++app.models.registry, app.storage.vector_repository, app.storage.image_storage,
++app.services.similarity/indexing, or app.workers.* — so torch, transformers,
++sentence-transformers and qdrant-client are never imported and never loaded
++into RAM. That is what makes this an "extremely lightweight" deployment, as
++opposed to registering the same blueprint inside the full xplagiax monolith
++(see app/factory.py) — also supported, but that process shares RAM with
++CLIP/SigLIP/Qdrant regardless of whether reverse-search is even used.
++
++Usage:
++    # Production (Gunicorn)
++    gunicorn "app.reverse_search.app:create_app()" \\
++        --config docker/gunicorn.reverse_search.conf.py
++
++    # Development
++    FLASK_DEBUG=true python -m flask --app "app.reverse_search.app:create_app" run
++"""
++
++from __future__ import annotations
++
++import os
++
++from flask import Flask, jsonify
++
++from app.config import load_config
++from app.observability.telemetry import configure_logging, get_logger, init_metrics, instrument_flask
++
++
++def create_app(config=None) -> Flask:
++    app = Flask(__name__)
++
++    if config is None:
++        config = load_config()
++    configure_logging(config.observability.log_level, config.observability.log_format)
++    logger = get_logger(__name__)
++    app.debug = config.debug
++
++    logger.info(
++        "reverse_search_app_starting",
++        service=config.observability.service_name,
++        environment=config.observability.environment,
++    )
++
++    metrics = init_metrics(config.observability.service_name)
++    if config.observability.prometheus_enabled:
++        # Avoid "Address already in use" when the Werkzeug reloader forks.
++        if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
++            metrics.start_prometheus_server(config.observability.prometheus_port)
++
++    from app.cache.redis_client import CacheClient
++    cache = CacheClient(
++        host=config.redis.host,
++        port=config.redis.port,
++        password=config.redis.password,
++        db=config.redis.db,
++        socket_timeout=config.redis.socket_timeout,
++        embedding_ttl=config.redis.embedding_ttl,
++        result_ttl=config.redis.result_ttl,
++        job_ttl=config.redis.job_ttl,
++        reverse_ttl=config.redis.reverse_ttl,
++        ai_ttl=config.redis.ai_ttl,
++    )
++    app.extensions["xplagiax_cache"] = cache
++
++    from app.reverse_search.factory import build_reverse_search_orchestrator
++    orchestrator = build_reverse_search_orchestrator(config.reverse_search, cache)
++    app.extensions["xplagiax_reverse_search_orchestrator"] = orchestrator
++    app.extensions["xplagiax_reverse_search_config"] = config.reverse_search
++
++    app.extensions["xplagiax_security_config"] = config.security
++    app.config["MAX_CONTENT_LENGTH"] = config.security.max_image_bytes
++
++    from app.reverse_search.routes import reverse_search_bp
++    app.register_blueprint(reverse_search_bp)
++
++    @app.route("/healthz")
++    def liveness():
++        return jsonify({"status": "alive"}), 200
++
++    @app.route("/readyz")
++    def readiness():
++        ready = orchestrator is not None
++        return jsonify({
++            "status": "ready" if ready else "not_ready",
++            "checks": {"reverse_search": ready, "redis": cache.available},
++        }), (200 if ready else 503)
++
++    from app.security.middleware import SecurityMiddleware, register_error_handlers
++    register_error_handlers(app)
++    app.wsgi_app = SecurityMiddleware(app.wsgi_app, max_content_length=config.security.max_image_bytes)
++
++    # ProxyFix MUST be outermost so REMOTE_ADDR/scheme reflect the real client
++    # before SecurityMiddleware and the rate limiter run.
++    from werkzeug.middleware.proxy_fix import ProxyFix
++    app.wsgi_app = ProxyFix(
++        app.wsgi_app,
++        x_for=config.security.trusted_proxy_count,
++        x_proto=config.security.trusted_proxy_count,
++        x_host=config.security.trusted_proxy_count,
++    )
++    instrument_flask(app)
++
++    logger.info(
++        "reverse_search_app_ready",
++        endpoints=["/healthz", "/readyz", "/api/v1/reverse-image-search"],
++    )
++    return app
+diff --git a/app/reverse_search/cache.py b/app/reverse_search/cache.py
+new file mode 100644
+index 0000000..265e834
+--- /dev/null
++++ b/app/reverse_search/cache.py
+@@ -0,0 +1,67 @@
++"""
++SHA-256 keyed cache for reverse-image-search results.
++
++Same image bytes -> same digest -> same cache key. The digest is computed
++EXACTLY ONCE by the orchestrator and passed in here; this module never
++re-hashes. Positive ("found") results are cached far longer than negative
++ones: a discovered copy of an image rarely un-appears, but "not found today"
++can flip to "found" as provider indexes grow — so a miss must not be allowed
++to silence re-checks for weeks.
++
++Built on top of the existing CacheClient (Redis, graceful degradation) rather
++than a new Redis connection — if Redis is down, get() simply misses and set()
++is a no-op, exactly like the rest of the app.
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++
++from app.reverse_search.models import ReverseSearchResult
++
++_PREFIX = "reverse_search_v1"  # bump the version if the cached payload shape ever changes
++
++
++class ReverseSearchCache:
++    def __init__(self, cache_client, ttl_found: int, ttl_not_found: int) -> None:
++        self._cache = cache_client
++        self._ttl_found = ttl_found
++        self._ttl_not_found = ttl_not_found
++
++    @property
++    def available(self) -> bool:
++        return bool(self._cache and self._cache.available)
++
++    @staticmethod
++    def _key(digest: str) -> str:
++        return f"{_PREFIX}:{digest}"
++
++    def get(self, digest: str) -> Optional[ReverseSearchResult]:
++        if not self.available:
++            return None
++        raw = self._cache.get(self._key(digest))
++        if raw is None:
++            return None
++        return ReverseSearchResult(
++            found=raw.get("found", False),
++            website=raw.get("website"),
++            url=raw.get("url"),
++            similarity=raw.get("similarity", 0.0),
++            provider=raw.get("provider"),
++            elapsed_ms=0,  # caller overwrites with the actual cache-lookup latency
++            cache_hit=True,
++            stop_reason="cache_hit",
++        )
++
++    def set(self, digest: str, result: ReverseSearchResult) -> None:
++        if not self.available:
++            return
++        ttl = self._ttl_found if result.found else self._ttl_not_found
++        payload = {
++            "found": result.found,
++            "website": result.website,
++            "url": result.url,
++            "similarity": result.similarity,
++            "provider": result.provider,
++        }
++        self._cache.set(self._key(digest), payload, ttl)
+diff --git a/app/reverse_search/factory.py b/app/reverse_search/factory.py
+new file mode 100644
+index 0000000..8d2456e
+--- /dev/null
++++ b/app/reverse_search/factory.py
+@@ -0,0 +1,98 @@
++"""
++Dependency wiring for the reverse-image-search module.
++
++Pure DI: builds provider adapters + the orchestrator from config. No Flask
++here on purpose — this is reused by both the standalone microservice
++entrypoint (app/reverse_search/app.py) and the existing monolith
++(app/factory.py), and neither of those should have to duplicate this wiring.
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++
++import requests
++from requests.adapters import HTTPAdapter
++
++from app.config import ReverseSearchConfig
++from app.observability.telemetry import get_logger
++from app.reverse_search.cache import ReverseSearchCache
++from app.reverse_search.orchestrator import ProviderSlot, ReverseSearchOrchestrator
++from app.reverse_search.providers.google_vision import GoogleVisionProvider
++from app.reverse_search.providers.mungfali import MungfaliProvider
++from app.reverse_search.providers.serper_lens import SerperLensProvider
++from app.reverse_search.temp_hosting import TempImageHost
++
++logger = get_logger(__name__)
++
++
++def build_reverse_search_orchestrator(
++    config: ReverseSearchConfig, cache_client
++) -> Optional[ReverseSearchOrchestrator]:
++    """
++    Returns None when the feature is disabled or no provider is usable.
++    Callers (routes) must handle that as a 503 — never assume a non-None result.
++    """
++    if not config.enabled:
++        return None
++
++    # One pooled, keep-alive session shared by every provider adapter in this
++    # process — avoids a fresh TCP/TLS handshake on every external API call.
++    session = requests.Session()
++    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
++    session.mount("https://", adapter)
++    session.mount("http://", adapter)
++
++    slots: list[ProviderSlot] = []
++
++    if config.google_vision.enabled and config.google_vision_api_key:
++        slots.append(ProviderSlot(
++            name="google_vision",
++            provider=GoogleVisionProvider(
++                config.google_vision_api_key, session=session, max_retries=config.max_retries
++            ),
++            priority=config.google_vision.priority,
++            stop_threshold=config.google_vision.stop_threshold,
++            timeout_s=config.google_vision.timeout_s,
++            requires_public_url=config.google_vision.requires_public_url,
++        ))
++
++    if config.serper.enabled and config.serper_api_key:
++        slots.append(ProviderSlot(
++            name="serper",
++            provider=SerperLensProvider(
++                config.serper_api_key, session=session, max_retries=config.max_retries
++            ),
++            priority=config.serper.priority,
++            stop_threshold=config.serper.stop_threshold,
++            timeout_s=config.serper.timeout_s,
++            requires_public_url=config.serper.requires_public_url,
++        ))
++
++    if config.mungfali.enabled and config.mungfali_api_key:
++        slots.append(ProviderSlot(
++            name="mungfali",
++            provider=MungfaliProvider(config.mungfali_api_key),
++            priority=config.mungfali.priority,
++            stop_threshold=config.mungfali.stop_threshold,
++            timeout_s=config.mungfali.timeout_s,
++            requires_public_url=config.mungfali.requires_public_url,
++        ))
++
++    if not slots:
++        logger.warning(
++            "reverse_search_orchestrator_disabled",
++            reason="No reverse-image-search provider is both enabled and configured with an API key.",
++        )
++        return None
++
++    reverse_cache = ReverseSearchCache(
++        cache_client, ttl_found=config.cache_ttl_found, ttl_not_found=config.cache_ttl_not_found
++    )
++    temp_host = TempImageHost(
++        cache_client, public_base_url=config.public_base_url, ttl_s=config.temp_hosting_ttl
++    ) if any(s.requires_public_url for s in slots) else None
++
++    return ReverseSearchOrchestrator(
++        slots=slots, cache=reverse_cache, temp_host=temp_host, max_providers=config.max_providers
++    )
+diff --git a/app/reverse_search/models.py b/app/reverse_search/models.py
+new file mode 100644
+index 0000000..b9cc65e
+--- /dev/null
++++ b/app/reverse_search/models.py
+@@ -0,0 +1,60 @@
++"""
++Data models for the reverse-image-search module.
++
++Kept intentionally tiny: a provider match (raw signal from one provider) and
++a search result (what the orchestrator returns). Plain frozen dataclasses are
++enough for six fields — no ORM, no schema validation framework.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, replace
++from typing import Optional
++
++
++@dataclass(frozen=True)
++class ProviderMatch:
++    """Best match found by a single provider for one query image."""
++    website: str
++    url: str
++    similarity: float  # 0-100
++
++
++@dataclass(frozen=True)
++class ReverseSearchResult:
++    """
++    Outcome of the full early-stop search.
++
++    to_response() returns exactly the six fields the public API contract
++    promises. cache_hit/stop_reason exist for server-side logging only and
++    are never serialized to the client ("nada mas" per spec).
++    """
++    found: bool
++    website: Optional[str]
++    url: Optional[str]
++    similarity: float
++    provider: Optional[str]
++    elapsed_ms: int
++    cache_hit: bool = False
++    # "threshold_met" | "providers_exhausted" | "cache_hit" | "no_providers_available"
++    stop_reason: Optional[str] = None
++
++    def to_response(self) -> dict:
++        return {
++            "found": self.found,
++            "website": self.website,
++            "url": self.url,
++            "similarity": self.similarity,
++            "provider": self.provider,
++            "elapsed_ms": self.elapsed_ms,
++        }
++
++    def with_timing(self, elapsed_ms: int, cache_hit: bool = False) -> "ReverseSearchResult":
++        """Return a copy with updated timing/cache_hit (used after a cache read,
++        since the cached payload doesn't know how long *this* lookup took)."""
++        return replace(self, elapsed_ms=elapsed_ms, cache_hit=cache_hit)
++
++
++NOT_FOUND = ReverseSearchResult(
++    found=False, website=None, url=None, similarity=0.0, provider=None, elapsed_ms=0,
++)
+diff --git a/app/reverse_search/orchestrator.py b/app/reverse_search/orchestrator.py
+new file mode 100644
+index 0000000..2acf188
+--- /dev/null
++++ b/app/reverse_search/orchestrator.py
+@@ -0,0 +1,187 @@
++"""
++Early-stop orchestrator — the core cost-saving logic of this module.
++
++Providers are tried in priority order (lowest number first). As soon as one
++returns a similarity >= its OWN configured stop_threshold, the search stops
++immediately: no further providers are called, no further quota is spent.
++This is the single most important behavior here — see the "early stop"
++requirement this module exists to satisfy.
++
++Design notes:
++  - The image is hashed with SHA-256 exactly once, at the top of search().
++    That digest is the cache key. Nothing downstream re-hashes or re-reads
++    the bytes.
++  - Only the first URL-based provider reached in a request needs a temporary
++    public URL; it's created lazily and reused for any later URL-based
++    provider in the same request. If every enabled provider takes inline
++    bytes (e.g. only Google Vision), hosting is never created — zero cost.
++  - Every provider attempt is wrapped in its own try/except: one provider's
++    failure is logged and the chain moves on, it never fails the request.
++  - Nothing here ever logs image bytes.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import time
++from dataclasses import dataclass
++from typing import Optional
++
++from app.observability.telemetry import get_logger
++from app.reverse_search.cache import ReverseSearchCache
++from app.reverse_search.models import ReverseSearchResult
++from app.reverse_search.providers.base import ProviderError, ReverseSearchProvider
++from app.reverse_search.temp_hosting import TempHostingUnavailableError, TempImageHost
++
++logger = get_logger(__name__)
++
++
++@dataclass(frozen=True)
++class ProviderSlot:
++    """One entry in the priority-ordered provider chain."""
++    name: str
++    provider: ReverseSearchProvider
++    priority: int
++    stop_threshold: float
++    timeout_s: float
++    requires_public_url: bool
++
++
++class ReverseSearchOrchestrator:
++    def __init__(
++        self,
++        slots: list[ProviderSlot],
++        cache: ReverseSearchCache,
++        temp_host: Optional[TempImageHost],
++        max_providers: int,
++    ) -> None:
++        ordered = sorted(slots, key=lambda s: s.priority)
++        self._slots = ordered[:max_providers] if max_providers and max_providers > 0 else ordered
++        self._cache = cache
++        self._temp_host = temp_host
++
++    @property
++    def temp_host(self) -> Optional[TempImageHost]:
++        """Exposed so routes.py can register the internal image-serving
++        endpoint against the same TempImageHost instance used here."""
++        return self._temp_host
++
++    def search(self, image_bytes: bytes, content_type: str = "application/octet-stream") -> ReverseSearchResult:
++        t0 = time.perf_counter()
++        digest = hashlib.sha256(image_bytes).hexdigest()
++
++        cached = self._cache.get(digest)
++        if cached is not None:
++            result = cached.with_timing(int((time.perf_counter() - t0) * 1000), cache_hit=True)
++            logger.info(
++                "reverse_search_completed",
++                cache_hit=True, found=result.found, provider=result.provider,
++                similarity=result.similarity, elapsed_ms=result.elapsed_ms,
++                stop_reason="cache_hit",
++            )
++            return result
++
++        if not self._slots:
++            elapsed_ms = int((time.perf_counter() - t0) * 1000)
++            logger.warning("reverse_search_no_providers_available", elapsed_ms=elapsed_ms)
++            return ReverseSearchResult(
++                found=False, website=None, url=None, similarity=0.0, provider=None,
++                elapsed_ms=elapsed_ms, stop_reason="no_providers_available",
++            )
++
++        best_match = None
++        best_provider: Optional[str] = None
++        hosted_url: Optional[str] = None
++
++        for slot in self._slots:
++            image_url = None
++            if slot.requires_public_url:
++                if hosted_url is None:
++                    if self._temp_host is None:
++                        logger.warning(
++                            "reverse_search_provider_skipped",
++                            provider=slot.name, status="hosting_unavailable",
++                        )
++                        continue
++                    try:
++                        hosted_url = self._temp_host.host(image_bytes, content_type=content_type)
++                        self._temp_host.warn_if_unreachable(logger)
++                    except TempHostingUnavailableError as exc:
++                        logger.warning(
++                            "reverse_search_provider_skipped",
++                            provider=slot.name, status="hosting_unavailable", reason=str(exc),
++                        )
++                        continue
++                image_url = hosted_url
++
++            provider_t0 = time.perf_counter()
++            try:
++                match = slot.provider.search(
++                    image_bytes=image_bytes, image_url=image_url, timeout_s=slot.timeout_s
++                )
++            except ProviderError as exc:
++                logger.warning(
++                    "reverse_search_provider_error",
++                    provider=slot.name, status=type(exc).__name__, error=str(exc),
++                    elapsed_ms=round((time.perf_counter() - provider_t0) * 1000, 1),
++                )
++                continue
++            except Exception as exc:  # never let one adapter's bug fail the whole request
++                logger.error(
++                    "reverse_search_provider_unexpected_error",
++                    provider=slot.name, error=str(exc), exc_info=True,
++                )
++                continue
++
++            provider_elapsed_ms = round((time.perf_counter() - provider_t0) * 1000, 1)
++
++            if match is None:
++                logger.info(
++                    "reverse_search_provider_attempt",
++                    provider=slot.name, status="no_match", elapsed_ms=provider_elapsed_ms,
++                )
++                continue
++
++            logger.info(
++                "reverse_search_provider_attempt",
++                provider=slot.name, status="match", similarity=match.similarity,
++                elapsed_ms=provider_elapsed_ms,
++            )
++
++            if best_match is None or match.similarity > best_match.similarity:
++                best_match, best_provider = match, slot.name
++
++            if match.similarity >= slot.stop_threshold:
++                elapsed_ms = int((time.perf_counter() - t0) * 1000)
++                result = ReverseSearchResult(
++                    found=True, website=match.website, url=match.url,
++                    similarity=match.similarity, provider=slot.name,
++                    elapsed_ms=elapsed_ms, stop_reason="threshold_met",
++                )
++                self._cache.set(digest, result)
++                logger.info(
++                    "reverse_search_completed", cache_hit=False, found=True,
++                    provider=slot.name, similarity=match.similarity,
++                    elapsed_ms=elapsed_ms, stop_reason="threshold_met",
++                )
++                return result
++
++        elapsed_ms = int((time.perf_counter() - t0) * 1000)
++        if best_match is not None:
++            result = ReverseSearchResult(
++                found=True, website=best_match.website, url=best_match.url,
++                similarity=best_match.similarity, provider=best_provider,
++                elapsed_ms=elapsed_ms, stop_reason="providers_exhausted",
++            )
++        else:
++            result = ReverseSearchResult(
++                found=False, website=None, url=None, similarity=0.0, provider=None,
++                elapsed_ms=elapsed_ms, stop_reason="providers_exhausted",
++            )
++        self._cache.set(digest, result)
++        logger.info(
++            "reverse_search_completed", cache_hit=False, found=result.found,
++            provider=result.provider, similarity=result.similarity,
++            elapsed_ms=elapsed_ms, stop_reason="providers_exhausted",
++        )
++        return result
+diff --git a/app/reverse_search/providers/__init__.py b/app/reverse_search/providers/__init__.py
+new file mode 100644
+index 0000000..0b5e773
+--- /dev/null
++++ b/app/reverse_search/providers/__init__.py
+@@ -0,0 +1 @@
++# Provider adapters for the reverse-image-search early-stop chain.
+diff --git a/app/reverse_search/providers/base.py b/app/reverse_search/providers/base.py
+new file mode 100644
+index 0000000..b45caba
+--- /dev/null
++++ b/app/reverse_search/providers/base.py
+@@ -0,0 +1,105 @@
++"""
++Provider contract for the reverse-image-search chain.
++
++Every adapter subclasses ReverseSearchProvider and implements search(). On
++failure it raises one of the typed exceptions below — the orchestrator treats
++"no match" (return None) and "provider failed" (raised exception) differently:
++a failed provider is logged and skipped, never turned into a 500 for the
++caller. The whole point of chaining providers is resilience to any single
++one having a bad day.
++
++Retry policy (shared by all adapters via retry_call): retry ONLY on 429 and
++5xx. Never retry 401/403 (bad credentials — retrying can't fix that) or 404
++(no result — not an error). This mirrors the "RETRIES" section of the spec
++exactly and lives in one place so no adapter re-implements backoff.
++"""
++
++from __future__ import annotations
++
++import random
++import time
++from typing import Callable, Optional, TypeVar
++
++from app.reverse_search.models import ProviderMatch
++
++T = TypeVar("T")
++
++RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
++NEVER_RETRY_STATUS = frozenset({401, 403, 404})
++
++
++class ProviderError(Exception):
++    """Base class for all provider failures."""
++    def __init__(self, provider: str, message: str) -> None:
++        self.provider = provider
++        super().__init__(f"[{provider}] {message}")
++
++
++class ProviderAuthError(ProviderError):
++    """401/403 — bad or missing API key. Never retried; almost always a config issue."""
++    def __init__(self, provider: str, status_code: int) -> None:
++        self.status_code = status_code
++        super().__init__(provider, f"authentication failed (HTTP {status_code})")
++
++
++class ProviderRateLimitError(ProviderError):
++    """429 — provider quota/rate limit hit. Retryable, honors Retry-After if present."""
++    def __init__(self, provider: str, retry_after: Optional[float] = None) -> None:
++        self.retry_after = retry_after
++        super().__init__(provider, "rate limited (HTTP 429)")
++
++
++class ProviderTransientError(ProviderError):
++    """5xx — transient server-side failure, safe to retry a bounded number of times."""
++    def __init__(self, provider: str, status_code: int) -> None:
++        self.status_code = status_code
++        super().__init__(provider, f"transient server error (HTTP {status_code})")
++
++
++class ProviderTimeoutError(ProviderError):
++    """Connect or read timeout — the provider took too long. Not retried here;
++    the next provider in the chain is tried instead (retrying a slow provider
++    only makes p99 worse)."""
++    def __init__(self, provider: str) -> None:
++        super().__init__(provider, "request timed out")
++
++
++class ProviderUnavailableError(ProviderError):
++    """Provider not usable right now: missing config, or (Mungfali) an adapter
++    whose upstream contract could not be verified — see providers/mungfali.py."""
++
++
++class ProviderResponseError(ProviderError):
++    """Unexpected 4xx (not 401/403/404) or an unparseable response body."""
++
++
++class ReverseSearchProvider:
++    """Base class for provider adapters."""
++    name: str = "base"
++
++    def search(
++        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float
++    ) -> Optional[ProviderMatch]:
++        """Return the best match, or None if the provider found nothing.
++        Raise a ProviderError subclass if the call itself failed."""
++        raise NotImplementedError
++
++
++def retry_call(fn: Callable[[], T], *, max_retries: int) -> T:
++    """
++    Call fn() with retry ONLY for ProviderRateLimitError / ProviderTransientError.
++    Backoff: the provider's own Retry-After (429) when given, else capped
++    exponential (0.5s, 1s, 2s, 4s) plus a little jitter to avoid thundering
++    herds across concurrent requests.
++    """
++    attempt = 0
++    while True:
++        try:
++            return fn()
++        except (ProviderRateLimitError, ProviderTransientError) as exc:
++            attempt += 1
++            if attempt > max_retries:
++                raise
++            retry_after = getattr(exc, "retry_after", None)
++            delay = min(float(retry_after), 10.0) if retry_after else min(0.5 * (2 ** (attempt - 1)), 4.0)
++            time.sleep(delay + random.uniform(0, 0.25))
+diff --git a/app/reverse_search/providers/google_vision.py b/app/reverse_search/providers/google_vision.py
+new file mode 100644
+index 0000000..1546123
+--- /dev/null
++++ b/app/reverse_search/providers/google_vision.py
+@@ -0,0 +1,134 @@
++"""
++Google Vision API — WEB_DETECTION feature.
++
++True reverse-image-search from Google: given raw image bytes (base64 inline,
++NO public URL needed — the single biggest reason this is priority #1 by
++default), Vision returns pages containing matching images, grouped into
++confidence bands (full match / partial match / visually similar).
++
++Vision does not return a numeric similarity score for web matches, so we map
++its confidence bands to a fixed similarity percentage ourselves. This is a
++deliberate, documented heuristic, not a claim that Google computed these
++exact numbers — see _best_match() below.
++"""
++
++from __future__ import annotations
++
++import base64
++from typing import Optional
++from urllib.parse import urlparse
++
++import requests
++
++from app.reverse_search.models import ProviderMatch
++from app.reverse_search.providers.base import (
++    ProviderAuthError,
++    ProviderRateLimitError,
++    ProviderResponseError,
++    ProviderTimeoutError,
++    ProviderTransientError,
++    ReverseSearchProvider,
++    retry_call,
++)
++
++_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
++
++# Vision groups web matches by confidence band, not a numeric score. Mapping
++# each band to a fixed similarity lets it be compared against configurable
++# stop_threshold values the same way as every other provider.
++_SIMILARITY_FULL_MATCH = 99.0        # identical / near-identical image found verbatim
++_SIMILARITY_PARTIAL_MATCH = 90.0     # cropped / edited / recoloured / watermarked
++_SIMILARITY_PAGE_ONLY = 85.0         # page indexed with this image, no graded match list
++_SIMILARITY_VISUALLY_SIMILAR = 65.0  # loosely related images only
++
++
++class GoogleVisionProvider(ReverseSearchProvider):
++    name = "google_vision"
++
++    def __init__(
++        self, api_key: str, session: Optional[requests.Session] = None, max_retries: int = 2
++    ) -> None:
++        self._api_key = api_key
++        self._session = session or requests.Session()
++        self._max_retries = max_retries
++
++    def search(
++        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float
++    ) -> Optional[ProviderMatch]:
++        return retry_call(
++            lambda: self._search_once(image_bytes, timeout_s),
++            max_retries=self._max_retries,
++        )
++
++    def _search_once(self, image_bytes: bytes, timeout_s: float) -> Optional[ProviderMatch]:
++        body = {
++            "requests": [{
++                "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
++                "features": [{"type": "WEB_DETECTION", "maxResults": 5}],
++            }]
++        }
++        try:
++            resp = self._session.post(
++                _ENDPOINT,
++                params={"key": self._api_key},
++                json=body,
++                timeout=(timeout_s, timeout_s),
++            )
++        except requests.exceptions.Timeout as exc:
++            raise ProviderTimeoutError(self.name) from exc
++        except requests.exceptions.RequestException as exc:
++            raise ProviderTransientError(self.name, 0) from exc
++
++        if resp.status_code in (401, 403):
++            raise ProviderAuthError(self.name, resp.status_code)
++        if resp.status_code == 429:
++            retry_after = resp.headers.get("Retry-After")
++            raise ProviderRateLimitError(self.name, retry_after=float(retry_after) if retry_after else None)
++        if resp.status_code in (500, 502, 503, 504):
++            raise ProviderTransientError(self.name, resp.status_code)
++        if resp.status_code == 404:
++            return None
++        if resp.status_code != 200:
++            raise ProviderResponseError(self.name, f"unexpected HTTP {resp.status_code}: {resp.text[:200]}")
++
++        try:
++            payload = resp.json()
++        except ValueError as exc:
++            raise ProviderResponseError(self.name, "invalid JSON response") from exc
++
++        responses = payload.get("responses") or [{}]
++        web = (responses[0] or {}).get("webDetection") or {}
++        return self._best_match(web)
++
++    def _best_match(self, web: dict) -> Optional[ProviderMatch]:
++        full = web.get("fullMatchingImages") or []
++        partial = web.get("partialMatchingImages") or []
++        pages = web.get("pagesWithMatchingImages") or []
++        similar = web.get("visuallySimilarImages") or []
++
++        if pages:
++            page = pages[0]
++            url = page.get("url", "")
++            if url:
++                website = page.get("pageTitle") or _hostname(url)
++                if full:
++                    similarity = _SIMILARITY_FULL_MATCH
++                elif partial:
++                    similarity = _SIMILARITY_PARTIAL_MATCH
++                else:
++                    similarity = _SIMILARITY_PAGE_ONLY
++                return ProviderMatch(website=website, url=url, similarity=similarity)
++
++        if similar:
++            url = similar[0].get("url", "")
++            if url:
++                return ProviderMatch(website=_hostname(url), url=url, similarity=_SIMILARITY_VISUALLY_SIMILAR)
++
++        return None
++
++
++def _hostname(url: str) -> str:
++    try:
++        return urlparse(url).hostname or url
++    except ValueError:
++        return url
+diff --git a/app/reverse_search/providers/mungfali.py b/app/reverse_search/providers/mungfali.py
+new file mode 100644
+index 0000000..2dbca44
+--- /dev/null
++++ b/app/reverse_search/providers/mungfali.py
+@@ -0,0 +1,48 @@
++"""
++Mungfali — EXPERIMENTAL / UNVERIFIED adapter, disabled by default.
++
++Mungfali's public product documentation (mungfali.net) describes a keyword /
++stock-photo image search API ("search FOR images matching a text query"),
++not a confirmed "upload this image, tell me where it appears online"
++reverse-search endpoint. We could not verify a request/response contract for
++actual image-to-source lookup, and shipping a guessed API shape here would
++risk silently calling the wrong product (or a nonexistent endpoint) in
++production.
++
++This class exists as a structurally-complete extension point: it satisfies
++the ReverseSearchProvider contract so the orchestrator can treat it like any
++other provider in the chain, but search() always raises
++ProviderUnavailableError — the orchestrator logs that and moves on to the
++next provider, exactly as it would for a provider that's temporarily down.
++MUNGFALI_ENABLED defaults to false so this never runs unless explicitly
++turned on after the contract below is filled in.
++
++To finish this integration: confirm with Mungfali's dashboard/docs whether
++they expose an image-upload (or image-URL) reverse-search endpoint, what
++auth scheme it uses, and the response schema — then implement _search_once()
++the same way google_vision.py / serper_lens.py do.
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++
++from app.reverse_search.models import ProviderMatch
++from app.reverse_search.providers.base import ProviderUnavailableError, ReverseSearchProvider
++
++
++class MungfaliProvider(ReverseSearchProvider):
++    name = "mungfali"
++
++    def __init__(self, api_key: str) -> None:
++        self._api_key = api_key
++
++    def search(
++        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float
++    ) -> Optional[ProviderMatch]:
++        raise ProviderUnavailableError(
++            self.name,
++            "Mungfali adapter is a template — its documented public API is a "
++            "keyword image search product, not a verified reverse-image-search "
++            "endpoint. Confirm the real contract with the vendor before enabling.",
++        )
+diff --git a/app/reverse_search/providers/serper_lens.py b/app/reverse_search/providers/serper_lens.py
+new file mode 100644
+index 0000000..b7b7ae9
+--- /dev/null
++++ b/app/reverse_search/providers/serper_lens.py
+@@ -0,0 +1,106 @@
++"""
++Serper.dev — Google Lens endpoint.
++
++IMPORTANT: this deliberately targets https://google.serper.dev/lens, NOT
++Serper's plain /search endpoint. /search is a text web-search API and cannot
++do reverse image lookup at all — it was easy to mix the two up because both
++live under the same account/API key. /lens mirrors SerpApi's google_lens
++engine: give it a *publicly reachable* image URL and it returns the visual
++matches Google Lens found.
++
++Because this endpoint needs a URL (not inline bytes), the orchestrator only
++calls this provider after hosting the image via TempImageHost — see
++orchestrator.py. Serper does not expose a numeric similarity for Lens
++matches, so — like Vision — we assign a fixed confidence to the top match.
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++from urllib.parse import urlparse
++
++import requests
++
++from app.reverse_search.models import ProviderMatch
++from app.reverse_search.providers.base import (
++    ProviderAuthError,
++    ProviderRateLimitError,
++    ProviderResponseError,
++    ProviderTimeoutError,
++    ProviderTransientError,
++    ReverseSearchProvider,
++    retry_call,
++)
++
++_ENDPOINT = "https://google.serper.dev/lens"
++_SIMILARITY_TOP_MATCH = 92.0  # Serper Lens ranks by relevance but gives no numeric score
++
++
++class SerperLensProvider(ReverseSearchProvider):
++    name = "serper"
++
++    def __init__(
++        self, api_key: str, session: Optional[requests.Session] = None, max_retries: int = 2
++    ) -> None:
++        self._api_key = api_key
++        self._session = session or requests.Session()
++        self._max_retries = max_retries
++
++    def search(
++        self, *, image_bytes: bytes, image_url: Optional[str], timeout_s: float
++    ) -> Optional[ProviderMatch]:
++        if not image_url:
++            # Should never happen: the orchestrator hosts the image before
++            # calling any provider with requires_public_url=True.
++            raise ProviderResponseError(self.name, "no public image URL available")
++        return retry_call(
++            lambda: self._search_once(image_url, timeout_s),
++            max_retries=self._max_retries,
++        )
++
++    def _search_once(self, image_url: str, timeout_s: float) -> Optional[ProviderMatch]:
++        try:
++            resp = self._session.post(
++                _ENDPOINT,
++                headers={"X-API-KEY": self._api_key, "Content-Type": "application/json"},
++                json={"url": image_url},
++                timeout=(timeout_s, timeout_s),
++            )
++        except requests.exceptions.Timeout as exc:
++            raise ProviderTimeoutError(self.name) from exc
++        except requests.exceptions.RequestException as exc:
++            raise ProviderTransientError(self.name, 0) from exc
++
++        if resp.status_code in (401, 403):
++            raise ProviderAuthError(self.name, resp.status_code)
++        if resp.status_code == 429:
++            retry_after = resp.headers.get("Retry-After")
++            raise ProviderRateLimitError(self.name, retry_after=float(retry_after) if retry_after else None)
++        if resp.status_code in (500, 502, 503, 504):
++            raise ProviderTransientError(self.name, resp.status_code)
++        if resp.status_code == 404:
++            return None
++        if resp.status_code != 200:
++            raise ProviderResponseError(self.name, f"unexpected HTTP {resp.status_code}: {resp.text[:200]}")
++
++        try:
++            payload = resp.json()
++        except ValueError as exc:
++            raise ProviderResponseError(self.name, "invalid JSON response") from exc
++
++        matches = payload.get("organic") or []
++        if not matches:
++            return None
++        top = matches[0]
++        url = top.get("link") or ""
++        if not url:
++            return None
++        website = top.get("title") or top.get("source") or _hostname(url)
++        return ProviderMatch(website=website, url=url, similarity=_SIMILARITY_TOP_MATCH)
++
++
++def _hostname(url: str) -> str:
++    try:
++        return urlparse(url).hostname or url
++    except ValueError:
++        return url
+diff --git a/app/reverse_search/routes.py b/app/reverse_search/routes.py
+new file mode 100644
+index 0000000..afbc473
+--- /dev/null
++++ b/app/reverse_search/routes.py
+@@ -0,0 +1,182 @@
++"""
++Flask routes for the reverse-image-search module.
++
++  POST /api/v1/reverse-image-search         — single image. Returns exactly
++                                               the six-field contract: found,
++                                               website, url, similarity,
++                                               provider, elapsed_ms. Nothing else.
++  POST /api/v1/reverse-image-search/batch   — multiple images in one request.
++                                               Each is independent (its own
++                                               SHA-256, cache entry, and
++                                               Early Stop chain) so they're
++                                               fanned out concurrently with
++                                               gevent — only the provider
++                                               chain WITHIN one image stays
++                                               sequential, since that's what
++                                               Early Stop's cost saving
++                                               depends on.
++  GET  /api/v1/_tmp-image/<token>           — internal, single-use, short-TTL
++                                               image serving for URL-based
++                                               providers (see temp_hosting.py).
++                                               Deliberately NOT behind
++                                               require_auth: the external
++                                               provider's crawler fetches this
++                                               URL directly and cannot send
++                                               our API key. Safe because
++                                               tokens are random, single-use,
++                                               and expire in seconds.
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++
++import gevent
++from flask import Blueprint, Response, current_app, jsonify, request
++from werkzeug.datastructures import FileStorage
++
++from app.observability.telemetry import get_logger
++from app.security.middleware import rate_limit, require_auth
++from app.utils.image_fetcher import fetch_image_bytes
++from app.utils.image_validation import ImageValidationError, validate_image_header
++
++logger = get_logger(__name__)
++
++reverse_search_bp = Blueprint("reverse_search", __name__, url_prefix="/api/v1")
++
++_DEFAULT_MAX_BATCH_SIZE = 20
++
++
++def _svc(name: str):
++    return current_app.extensions.get(f"xplagiax_{name}")
++
++
++def _search_one(orchestrator, cfg, *, file_upload: Optional[FileStorage] = None,
++                 image_url: Optional[str] = None) -> tuple[dict, int]:
++    """
++    Validate + search a single image. Shared by the single and batch
++    endpoints so there's exactly one code path that reads bytes once,
++    validates the header, and calls the orchestrator.
++
++    Returns (payload, http_status). payload is either the 6-field result
++    contract or an {"error", "code"} pair.
++    """
++    try:
++        image_bytes, _filename = fetch_image_bytes(
++            file_upload=file_upload,
++            image_url=image_url,
++            image_path=None,  # local-path reads are an LFI risk; not exposed here
++            max_bytes=cfg.max_image_bytes,
++            allow_local_path=False,
++        )
++        detected_mime = validate_image_header(
++            image_bytes, max_bytes=cfg.max_image_bytes,
++            allowed_mimes=cfg.allowed_mime_types, max_pixels=cfg.max_image_pixels,
++        )
++    except ImageValidationError as exc:
++        return {"error": str(exc), "code": "INVALID_IMAGE"}, 400
++
++    result = orchestrator.search(image_bytes, content_type=f"image/{detected_mime}")
++    return result.to_response(), 200
++
++
++@reverse_search_bp.route("/reverse-image-search", methods=["POST"])
++@require_auth
++@rate_limit
++def reverse_image_search():
++    cfg = _svc("security_config")
++    orchestrator = _svc("reverse_search_orchestrator")
++    if orchestrator is None:
++        return jsonify({
++            "error": "Reverse image search unavailable — no provider configured",
++            "code": "SERVICE_UNAVAILABLE",
++        }), 503
++
++    params = (request.get_json(silent=True) or {}) if request.is_json else request.form.to_dict()
++    file_upload = request.files.get("image") or request.files.get("file")
++    image_url = params.get("image_url")
++
++    if not file_upload and not image_url:
++        return jsonify({
++            "error": "No image source provided (image file or image_url).",
++            "code": "MISSING_FILE",
++        }), 400
++
++    payload, status = _search_one(orchestrator, cfg, file_upload=file_upload, image_url=image_url)
++    return jsonify(payload), status
++
++
++@reverse_search_bp.route("/reverse-image-search/batch", methods=["POST"])
++@require_auth
++@rate_limit
++def reverse_image_search_batch():
++    cfg = _svc("security_config")
++    orchestrator = _svc("reverse_search_orchestrator")
++    if orchestrator is None:
++        return jsonify({
++            "error": "Reverse image search unavailable — no provider configured",
++            "code": "SERVICE_UNAVAILABLE",
++        }), 503
++
++    rs_cfg = _svc("reverse_search_config")
++    max_batch_size = rs_cfg.max_batch_size if rs_cfg else _DEFAULT_MAX_BATCH_SIZE
++
++    params = (request.get_json(silent=True) or {}) if request.is_json else request.form.to_dict()
++    files = request.files.getlist("files")
++    image_urls = params.get("image_urls") or []
++    if isinstance(image_urls, str):
++        image_urls = [image_urls]
++
++    total = len(files) + len(image_urls)
++    if total == 0:
++        return jsonify({
++            "error": "No images provided (files or image_urls).",
++            "code": "MISSING_FILES",
++        }), 400
++    if total > max_batch_size:
++        return jsonify({
++            "error": f"Maximum {max_batch_size} images per batch",
++            "code": "BATCH_TOO_LARGE",
++        }), 400
++
++    # Each job is independent — no shared state between images beyond the
++    # already-thread/greenlet-safe pooled requests.Session inside each
++    # provider adapter (the same session already serves concurrent client
++    # requests under the gevent worker, so this is nothing new).
++    jobs = []
++    for f in files:
++        if not f.filename:
++            jobs.append(("unknown", None, None, "Empty filename", "EMPTY_FILENAME"))
++            continue
++        jobs.append((f.filename, f, None, None, None))
++    for url in image_urls:
++        jobs.append((url, None, url, None, None))
++
++    def run_job(job):
++        source, file_upload, image_url, preset_error, preset_code = job
++        if preset_error:
++            return {"source": source, "error": preset_error, "code": preset_code}
++        payload, _status = _search_one(orchestrator, cfg, file_upload=file_upload, image_url=image_url)
++        payload["source"] = source
++        return payload
++
++    greenlets = [gevent.spawn(run_job, job) for job in jobs]
++    gevent.joinall(greenlets)
++    results = [g.value for g in greenlets]
++
++    return jsonify({"count": len(results), "results": results}), 207
++
++
++@reverse_search_bp.route("/_tmp-image/<token>", methods=["GET"])
++def serve_temp_image(token: str):
++    orchestrator = _svc("reverse_search_orchestrator")
++    temp_host = orchestrator.temp_host if orchestrator else None
++    if temp_host is None:
++        return jsonify({"error": "Not found", "code": "NOT_FOUND"}), 404
++
++    served = temp_host.fetch_and_consume(token)
++    if served is None:
++        return jsonify({"error": "Not found or already consumed", "code": "NOT_FOUND"}), 404
++
++    data, content_type = served
++    return Response(data, mimetype=content_type)
+diff --git a/app/reverse_search/temp_hosting.py b/app/reverse_search/temp_hosting.py
+new file mode 100644
+index 0000000..209e6db
+--- /dev/null
++++ b/app/reverse_search/temp_hosting.py
+@@ -0,0 +1,86 @@
++"""
++Ephemeral public exposure for uploaded image bytes.
++
++Some reverse-image-search providers (e.g. Serper's Lens endpoint) fetch the
++image themselves from a URL and don't accept inline bytes. Rather than
++standing up object storage for a few KB that need to live for two minutes,
++we serve them directly from this process via a short-TTL, single-use,
++unguessable token stored in Redis.
++
++This path is only exercised when a URL-based provider is actually reached.
++If an inline-bytes provider (Google Vision) already returns a confident
++match, hosting is never created — zero extra cost in the common case.
++"""
++
++from __future__ import annotations
++
++import secrets
++from typing import Optional, Tuple
++from urllib.parse import urlparse
++
++_KEY_PREFIX = "reverse_search_tmp"
++_DEFAULT_CONTENT_TYPE = "application/octet-stream"
++
++
++class TempHostingUnavailableError(Exception):
++    """A URL-based provider is enabled but there's no way to actually serve
++    the bytes (missing REVERSE_SEARCH_PUBLIC_BASE_URL and/or Redis is down)."""
++
++
++class TempImageHost:
++    def __init__(self, cache_client, public_base_url: Optional[str], ttl_s: int) -> None:
++        self._cache = cache_client  # CacheClient (Redis-backed, graceful degradation)
++        self._public_base_url = (public_base_url or "").rstrip("/")
++        self._ttl_s = ttl_s
++
++    @property
++    def available(self) -> bool:
++        return bool(self._cache and self._cache.available and self._public_base_url)
++
++    def host(self, image_bytes: bytes, content_type: str = _DEFAULT_CONTENT_TYPE) -> str:
++        """Store the bytes (+ their real content type, so the provider's
++        crawler sees a proper image/* response) under a random one-time
++        token; return the public URL."""
++        if not self.available:
++            raise TempHostingUnavailableError(
++                "No REVERSE_SEARCH_PUBLIC_BASE_URL / Redis configured — cannot "
++                "expose the image to a URL-based provider."
++            )
++        token = secrets.token_urlsafe(24)
++        self._cache.set_bytes(f"{_KEY_PREFIX}:{token}", image_bytes, self._ttl_s)
++        self._cache.set(f"{_KEY_PREFIX}:{token}:ct", content_type, self._ttl_s)
++        return f"{self._public_base_url}/api/v1/_tmp-image/{token}"
++
++    def fetch_and_consume(self, token: str) -> Optional[Tuple[bytes, str]]:
++        """Serve-once: return (bytes, content_type) and delete both keys
++        immediately, so the window an image is publicly fetchable is as
++        short as possible."""
++        key = f"{_KEY_PREFIX}:{token}"
++        data = self._cache.get_bytes(key)
++        if data is None:
++            return None
++        content_type = self._cache.get(f"{key}:ct") or _DEFAULT_CONTENT_TYPE
++        self._cache.delete(key)
++        self._cache.delete(f"{key}:ct")
++        return data, content_type
++
++    def warn_if_unreachable(self, logger) -> None:
++        """Heads-up if the configured base URL looks internal/loopback — mirrors
++        the existing check for the legacy reverse-search feature: providers can
++        never fetch a localhost/private URL, so this would silently return
++        nothing without an explicit signal in the logs."""
++        if not self._public_base_url:
++            return
++        host = (urlparse(self._public_base_url).hostname or "").lower()
++        internal = (
++            host in ("localhost", "127.0.0.1", "::1", "")
++            or host.endswith(".local") or host.endswith(".internal")
++            or host.startswith(("10.", "192.168.", "172."))
++        )
++        if internal:
++            logger.warning(
++                "reverse_search_public_url_not_public",
++                host=host,
++                hint="URL-based providers cannot fetch internal URLs. Set "
++                     "REVERSE_SEARCH_PUBLIC_BASE_URL to a real public host.",
++            )
+diff --git a/app/utils/image_validation.py b/app/utils/image_validation.py
+index 1003137..14273ec 100644
+--- a/app/utils/image_validation.py
++++ b/app/utils/image_validation.py
+@@ -58,28 +58,19 @@ class ImageValidationError(ValueError):
+ # Public API
+ # ---------------------------------------------------------------------------
+ 
+-def validate_and_load(
++def _validate_header(
+     file_bytes: bytes,
+-    max_bytes: int = 20 * 1024 * 1024,
+-    allowed_mimes: Optional[frozenset] = None,
+-    max_pixels: int = _DEFAULT_MAX_PIXELS,
+-) -> Tuple[Image.Image, str]:
++    max_bytes: int,
++    allowed_mimes: Optional[frozenset],
++    max_pixels: int,
++) -> Tuple[str, int, int, int]:
+     """
+-    Validate image bytes and return a loaded PIL Image + detected mime type.
+-
+-    Steps (fail-fast order):
+-      1. Size limit
+-      2. Magic byte detection
+-      3. Mime allowlist
+-      4. Header parse (lazy) → dimension + pixel-count + frame checks
+-         BEFORE decoding pixels (prevents decompression-bomb RAM blow-up)
+-      5. Integrity verify() then decode to RGB
+-
+-    Returns:
+-        (PIL.Image in RGB mode, detected_mime_type)
++    Shared steps 1-4 (size, magic bytes, allowlist, header+integrity probe)
++    used by both validate_and_load() (which also decodes to RGB) and
++    validate_image_header() (which does not — see that function's docstring).
+ 
+-    Raises:
+-        ImageValidationError: on any validation failure (use 400/413 response)
++    Returns (detected_mime, width, height, n_frames).
++    Raises ImageValidationError on any failure.
+     """
+     if allowed_mimes is None:
+         allowed_mimes = frozenset({"jpeg", "png", "webp", "bmp", "tiff", "gif"})
+@@ -135,6 +126,40 @@ def validate_and_load(
+             f"Animated / multi-page images are not allowed ({n_frames} frames)."
+         )
+ 
++    return detected_mime, w, h, n_frames
++
++
++def validate_and_load(
++    file_bytes: bytes,
++    max_bytes: int = 20 * 1024 * 1024,
++    allowed_mimes: Optional[frozenset] = None,
++    max_pixels: int = _DEFAULT_MAX_PIXELS,
++) -> Tuple[Image.Image, str]:
++    """
++    Validate image bytes and return a loaded PIL Image + detected mime type.
++
++    Steps (fail-fast order):
++      1. Size limit
++      2. Magic byte detection
++      3. Mime allowlist
++      4. Header parse (lazy) → dimension + pixel-count + frame checks
++         BEFORE decoding pixels (prevents decompression-bomb RAM blow-up)
++      5. Integrity verify() then decode to RGB
++
++    Use this when the caller needs actual pixel data (ML inference, thumbnailing).
++    If the caller only forwards the original bytes untouched (e.g. reverse image
++    search providers), use validate_image_header() instead — it skips the RGB
++    decode entirely, since decoding+re-encoding would waste CPU and can only
++    degrade match quality against the bytes the user actually uploaded.
++
++    Returns:
++        (PIL.Image in RGB mode, detected_mime_type)
++
++    Raises:
++        ImageValidationError: on any validation failure (use 400/413 response)
++    """
++    detected_mime, w, h, _n_frames = _validate_header(file_bytes, max_bytes, allowed_mimes, max_pixels)
++
+     # --- 5. Decode to RGB ---
+     try:
+         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+@@ -153,6 +178,32 @@ def validate_and_load(
+     return img, detected_mime
+ 
+ 
++def validate_image_header(
++    file_bytes: bytes,
++    max_bytes: int = 20 * 1024 * 1024,
++    allowed_mimes: Optional[frozenset] = None,
++    max_pixels: int = _DEFAULT_MAX_PIXELS,
++) -> str:
++    """
++    Validate image bytes WITHOUT decoding pixels or allocating a PIL RGB image.
++
++    Same guarantees as validate_and_load() (size cap, magic bytes, mime
++    allowlist, decompression-bomb guard, corruption/truncation check) but
++    skips step 5 (RGB decode + resize). Callers that only ever forward the
++    original bytes (reverse-image-search providers, storage, hashing) should
++    use this — it avoids an unnecessary full image decode + re-encode on
++    every request.
++
++    Returns:
++        detected_mime_type
++
++    Raises:
++        ImageValidationError: on any validation failure (use 400/413 response)
++    """
++    detected_mime, _w, _h, _n_frames = _validate_header(file_bytes, max_bytes, allowed_mimes, max_pixels)
++    return detected_mime
++
++
+ def sanitise_filename(filename: str) -> str:
+     """
+     Strip directory components and normalise filename.
+diff --git a/docker/Dockerfile.reverse-search b/docker/Dockerfile.reverse-search
+new file mode 100644
+index 0000000..fae5ae0
+--- /dev/null
++++ b/docker/Dockerfile.reverse-search
+@@ -0,0 +1,91 @@
++# ==============================================================
++# docker/Dockerfile.reverse-search
++#
++# Standalone image for the lightweight reverse-image-search microservice.
++# No torch, no transformers, no CUDA, no HuggingFace cache, no Qdrant client,
++# no SeaweedFS — only the modules app.reverse_search.app actually imports.
++# ==============================================================
++
++# --------------------------------------------------------------
++# Stage 1 — Builder
++# --------------------------------------------------------------
++FROM python:3.11-slim AS builder
++
++WORKDIR /build
++
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    gcc \
++    libjpeg-dev \
++    libpng-dev \
++    && rm -rf /var/lib/apt/lists/*
++
++COPY requirements-reverse-search.txt .
++RUN pip install --upgrade pip --no-cache-dir && \
++    pip install --prefix=/install --no-cache-dir -r requirements-reverse-search.txt
++
++# --------------------------------------------------------------
++# Stage 2 — Runtime
++# --------------------------------------------------------------
++FROM python:3.11-slim AS runtime
++
++LABEL description="xplagiax reverse-image-search — lightweight, no local ML" \
++      version="1.0.0"
++
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    libjpeg62-turbo \
++    libpng16-16 \
++    curl \
++    && rm -rf /var/lib/apt/lists/*
++
++RUN groupadd -r reversesearch && \
++    useradd -r -g reversesearch -d /app -s /sbin/nologin reversesearch
++
++WORKDIR /app
++
++COPY --from=builder /install /usr/local
++
++# Only the packages this service actually imports — deliberately excludes
++# app/models, app/storage, app/services/{similarity,indexing}.py and
++# app/workers, so the "no local ML" guarantee is visible in the build itself,
++# not just in requirements-reverse-search.txt.
++COPY app/__init__.py                   ./app/__init__.py
++COPY app/config.py                     ./app/config.py
++COPY app/reverse_search/               ./app/reverse_search/
++COPY app/security/                     ./app/security/
++COPY app/observability/                ./app/observability/
++COPY app/cache/                        ./app/cache/
++COPY app/utils/                        ./app/utils/
++COPY docker/gunicorn.reverse_search.conf.py ./gunicorn.conf.py
++
++RUN mkdir -p /tmp/reverse_search && \
++    chown -R reversesearch:reversesearch /app /tmp/reverse_search
++
++USER reversesearch
++
++ENV PYTHONUNBUFFERED=1 \
++    PYTHONDONTWRITEBYTECODE=1 \
++    PYTHONPATH=/app \
++    FLASK_DEBUG=false \
++    PORT=5020 \
++    LOG_LEVEL=INFO \
++    LOG_FORMAT=json \
++    REVERSE_SEARCH_ENABLED=true \
++    REQUIRE_AUTH=true \
++    MAX_IMAGE_BYTES=10485760 \
++    ALLOWED_MIME_TYPES=jpeg,png,webp \
++    RATE_LIMIT_PER_MINUTE=30 \
++    RATE_LIMIT_PER_HOUR=500 \
++    PROMETHEUS_ENABLED=false \
++    SERVICE_NAME=xplagiax-reverse-search \
++    ENVIRONMENT=production
++
++EXPOSE 5020
++
++HEALTHCHECK \
++    --interval=30s \
++    --timeout=5s \
++    --start-period=15s \
++    --retries=3 \
++    CMD curl -f http://localhost:${PORT}/healthz || exit 1
++
++CMD ["gunicorn", "--config", "gunicorn.conf.py", "app.reverse_search.app:create_app()"]
+diff --git a/docker/docker-compose.reverse-search.yml b/docker/docker-compose.reverse-search.yml
+new file mode 100644
+index 0000000..ed9871a
+--- /dev/null
++++ b/docker/docker-compose.reverse-search.yml
+@@ -0,0 +1,78 @@
++version: "3.9"
++
++# ==============================================================
++# Standalone deployment: reverse-image-search microservice + Redis ONLY.
++# No Qdrant, no SeaweedFS, no ML worker — nothing else needs to start. The
++# tight memory limits below are a live demonstration of the "extremely
++# lightweight" requirement, not just a claim in a doc.
++#
++# Usage:
++#   export SERVICE_API_KEY=...  REVERSE_SEARCH_PUBLIC_BASE_URL=https://...
++#   docker compose -f docker/docker-compose.reverse-search.yml up -d
++# ==============================================================
++
++services:
++
++  reverse-search:
++    build:
++      context: ..
++      dockerfile: docker/Dockerfile.reverse-search
++    image: xplagiax-reverse-search:latest
++    container_name: xplagiax-reverse-search
++    restart: unless-stopped
++    networks:
++      - reverse-search-net
++    ports:
++      - "5020:5020"
++    # No env_file: secrets are injected from the shell / secret store, never
++    # committed. ${VAR:?msg} fails fast if a required secret is missing.
++    environment:
++      REQUIRE_AUTH: "true"
++      SERVICE_API_KEY: ${SERVICE_API_KEY:?set SERVICE_API_KEY}
++      REDIS_HOST: redis
++      REDIS_PORT: "6379"
++      GOOGLE_VISION_API_KEY: ${GOOGLE_VISION_API_KEY:-}
++      SERPER_API_KEY: ${SERPER_API_KEY:-}
++      MUNGFALI_API_KEY: ${MUNGFALI_API_KEY:-}
++      MUNGFALI_ENABLED: "false"
++      # Required only if a URL-based provider (Serper Lens) is enabled — must
++      # be a real, internet-reachable URL for this service.
++      REVERSE_SEARCH_PUBLIC_BASE_URL: ${REVERSE_SEARCH_PUBLIC_BASE_URL:-}
++      SERVICE_NAME: xplagiax-reverse-search
++      ENVIRONMENT: production
++    depends_on:
++      redis:
++        condition: service_healthy
++    healthcheck:
++      test: ["CMD", "curl", "-f", "http://localhost:5020/healthz"]
++      interval: 30s
++      timeout: 5s
++      start_period: 15s
++      retries: 3
++    deploy:
++      resources:
++        limits:
++          memory: 256M
++          cpus: "1"
++
++  redis:
++    image: redis:7.2-alpine
++    container_name: xplagiax-reverse-search-redis
++    restart: unless-stopped
++    networks:
++      - reverse-search-net
++    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
++    healthcheck:
++      test: ["CMD", "redis-cli", "ping"]
++      interval: 10s
++      timeout: 3s
++      retries: 5
++    deploy:
++      resources:
++        limits:
++          memory: 300M
++          cpus: "0.5"
++
++networks:
++  reverse-search-net:
++    driver: bridge
+diff --git a/docker/gunicorn.reverse_search.conf.py b/docker/gunicorn.reverse_search.conf.py
+new file mode 100644
+index 0000000..11e36da
+--- /dev/null
++++ b/docker/gunicorn.reverse_search.conf.py
+@@ -0,0 +1,49 @@
++"""
++gunicorn.reverse_search.conf.py — Gunicorn config for the standalone
++reverse-image-search microservice.
++
++Worker class: gevent. Every request here is I/O-bound — SHA-256 hashing and
++image-header validation cost microseconds; the dominant cost is waiting on
++an external provider's HTTP response. gevent monkey-patches the socket layer
++so plain, synchronous-looking `requests` calls actually yield to the event
++loop under the hood, giving cooperative concurrency with zero async/await
++code. Unlike the main xplagiax Dockerfile (where CLIP/SigLIP inference is
++CPU-bound and holds the GIL, fighting gevent), there is no local inference
++here at all, so gevent is the right choice with no caveats.
++"""
++
++import os
++
++PORT = int(os.getenv("PORT", "5020"))
++bind = f"0.0.0.0:{PORT}"
++backlog = 512
++
++workers = int(os.getenv("WEB_CONCURRENCY", "2"))
++worker_class = "gevent"
++worker_connections = int(os.getenv("GUNICORN_WORKER_CONNECTIONS", "1000"))
++
++# Generous relative to the sum of per-provider timeouts + retries, but still bounded —
++# a request can never hang the worker indefinitely.
++timeout = 30
++graceful_timeout = 15
++keepalive = 2
++
++accesslog = "-"
++errorlog = "-"
++loglevel = os.getenv("LOG_LEVEL", "warning").lower()
++access_log_format = '{"t":"%(t)s","m":"%(m)s","u":"%(U)s","s":%(s)s,"ms":%(D)s}'
++
++proc_name = "xplagiax-reverse-search"
++preload_app = False
++
++# Recycle workers periodically to release fragmented memory.
++max_requests = 1000
++max_requests_jitter = 100
++
++limit_request_line = 4094
++limit_request_fields = 50
++limit_request_field_size = 4094
++
++
++def on_starting(server):
++    print(f"[reverse-search] listening on {PORT} | worker=gevent | no local ML")
+diff --git a/requirements-reverse-search.txt b/requirements-reverse-search.txt
+new file mode 100644
+index 0000000..d1ea06b
+--- /dev/null
++++ b/requirements-reverse-search.txt
+@@ -0,0 +1,40 @@
++# ============================================================
++# requirements-reverse-search.txt
++#
++# Dependencies for the STANDALONE reverse-image-search microservice
++# (app.reverse_search.app:create_app). Deliberately does NOT include torch,
++# transformers, sentence-transformers, accelerate, qdrant-client, imagehash
++# or opentelemetry — this process never imports app.models.registry or
++# app.storage.vector_repository, so none of that is ever loaded into RAM.
++#
++# Run: pip install -r requirements-reverse-search.txt
++# ============================================================
++
++# Web framework
++flask==3.0.3
++gunicorn==22.0.0
++gevent==24.2.1          # I/O-bound workload (see docker/gunicorn.reverse_search.conf.py);
++                        # also used directly to fan out /reverse-image-search/batch
++
++# Image validation only (magic bytes + decompression-bomb guard). No ML
++# decode path — pixels are never touched, only the header is inspected.
++Pillow==10.4.0
++
++# SHA-256 result cache + ephemeral temp-hosting for URL-based providers
++redis==5.0.8
++
++# HTTP client for calling external reverse-image-search providers
++requests==2.32.3
++
++# Observability
++structlog==24.4.0
++prometheus-client==0.20.0
++
++# Type annotations (stdlib in 3.11+, shim for 3.9/3.10)
++typing_extensions==4.12.2
++
++# ============================================================
++# Development / testing only (not installed in production)
++# ============================================================
++# pytest==8.2.2
++# pytest-mock==3.14.0
+diff --git a/tests/test_reverse_search.py b/tests/test_reverse_search.py
+new file mode 100644
+index 0000000..c973295
+--- /dev/null
++++ b/tests/test_reverse_search.py
+@@ -0,0 +1,500 @@
++"""
++Tests for the reverse-image-search module: early-stop orchestrator, cache
++TTL selection, and the shared retry policy. Uses the same unittest.TestCase
++style as tests/test_suite.py so both files run under either
++`pytest tests/ -v` or `python -m unittest`.
++
++Run:
++    pytest tests/test_reverse_search.py -v
++"""
++
++from __future__ import annotations
++
++import unittest
++from typing import Optional
++from unittest.mock import MagicMock, patch
++
++from app.reverse_search.cache import ReverseSearchCache
++from app.reverse_search.models import ProviderMatch, ReverseSearchResult
++from app.reverse_search.orchestrator import ProviderSlot, ReverseSearchOrchestrator
++from app.reverse_search.providers.base import (
++    ProviderAuthError,
++    ProviderRateLimitError,
++    ProviderTransientError,
++    ReverseSearchProvider,
++    retry_call,
++)
++from app.reverse_search.providers.mungfali import MungfaliProvider
++
++
++class _FakeProvider(ReverseSearchProvider):
++    """Test double: returns a fixed match/None, or raises a fixed exception,
++    and records every call so tests can assert whether it was invoked."""
++
++    def __init__(self, name: str, match: Optional[ProviderMatch] = None, error: Optional[Exception] = None):
++        self.name = name
++        self._match = match
++        self._error = error
++        self.calls = 0
++
++    def search(self, *, image_bytes, image_url, timeout_s):
++        self.calls += 1
++        if self._error is not None:
++            raise self._error
++        return self._match
++
++
++def _slot(provider: ReverseSearchProvider, priority: int, stop_threshold: float,
++          requires_public_url: bool = False) -> ProviderSlot:
++    return ProviderSlot(
++        name=provider.name, provider=provider, priority=priority,
++        stop_threshold=stop_threshold, timeout_s=1.0, requires_public_url=requires_public_url,
++    )
++
++
++def _no_cache() -> ReverseSearchCache:
++    """A cache that always misses / degrades — the orchestrator must still
++    behave correctly with caching effectively disabled."""
++    return ReverseSearchCache(cache_client=None, ttl_found=300, ttl_not_found=60)
++
++
++# ===========================================================================
++# TestEarlyStopOrchestrator
++# ===========================================================================
++
++class TestEarlyStopOrchestrator(unittest.TestCase):
++
++    def test_stops_at_first_provider_when_threshold_met(self):
++        p1 = _FakeProvider("p1", match=ProviderMatch(website="Wikipedia", url="https://es.wikipedia.org/x", similarity=99.7))
++        p2 = _FakeProvider("p2", match=ProviderMatch(website="Other", url="https://other.example/x", similarity=100.0))
++
++        orch = ReverseSearchOrchestrator(
++            slots=[_slot(p1, priority=1, stop_threshold=98.0), _slot(p2, priority=2, stop_threshold=95.0)],
++            cache=_no_cache(), temp_host=None, max_providers=3,
++        )
++        result = orch.search(b"fake-bytes")
++
++        self.assertTrue(result.found)
++        self.assertEqual(result.provider, "p1")
++        self.assertEqual(result.similarity, 99.7)
++        self.assertEqual(result.stop_reason, "threshold_met")
++        self.assertEqual(p1.calls, 1)
++        self.assertEqual(p2.calls, 0, "provider 2 must NOT be called once provider 1 met its threshold")
++
++    def test_falls_through_when_below_threshold(self):
++        p1 = _FakeProvider("p1", match=ProviderMatch(website="Weak", url="https://weak.example/x", similarity=62.0))
++        p2 = _FakeProvider("p2", match=ProviderMatch(website="Strong", url="https://strong.example/x", similarity=99.0))
++
++        orch = ReverseSearchOrchestrator(
++            slots=[_slot(p1, priority=1, stop_threshold=98.0), _slot(p2, priority=2, stop_threshold=95.0)],
++            cache=_no_cache(), temp_host=None, max_providers=3,
++        )
++        result = orch.search(b"fake-bytes")
++
++        self.assertTrue(result.found)
++        self.assertEqual(result.provider, "p2")
++        self.assertEqual(result.stop_reason, "threshold_met")
++        self.assertEqual(p1.calls, 1)
++        self.assertEqual(p2.calls, 1)
++
++    def test_no_match_from_any_provider(self):
++        p1 = _FakeProvider("p1", match=None)
++        p2 = _FakeProvider("p2", match=None)
++
++        orch = ReverseSearchOrchestrator(
++            slots=[_slot(p1, priority=1, stop_threshold=98.0), _slot(p2, priority=2, stop_threshold=95.0)],
++            cache=_no_cache(), temp_host=None, max_providers=3,
++        )
++        result = orch.search(b"fake-bytes")
++
++        self.assertFalse(result.found)
++        self.assertIsNone(result.provider)
++        self.assertEqual(result.stop_reason, "providers_exhausted")
++
++    def test_best_effort_result_when_no_threshold_is_met(self):
++        """Spec: if every provider is tried and none clears its threshold,
++        respond with the best result found so far — not a hard failure."""
++        p1 = _FakeProvider("p1", match=ProviderMatch(website="Weak", url="https://weak.example/x", similarity=62.0))
++        p2 = _FakeProvider("p2", match=ProviderMatch(website="Weaker", url="https://weaker.example/x", similarity=40.0))
++
++        orch = ReverseSearchOrchestrator(
++            slots=[_slot(p1, priority=1, stop_threshold=98.0), _slot(p2, priority=2, stop_threshold=98.0)],
++            cache=_no_cache(), temp_host=None, max_providers=3,
++        )
++        result = orch.search(b"fake-bytes")
++
++        self.assertTrue(result.found)
++        self.assertEqual(result.provider, "p1")  # 62.0 > 40.0
++        self.assertEqual(result.stop_reason, "providers_exhausted")
++
++    def test_provider_error_does_not_fail_the_request(self):
++        """A failing provider must be skipped, never raised to the caller."""
++        p1 = _FakeProvider("p1", error=ProviderAuthError("p1", 401))
++        p2 = _FakeProvider("p2", match=ProviderMatch(website="Ok", url="https://ok.example/x", similarity=97.0))
++
++        orch = ReverseSearchOrchestrator(
++            slots=[_slot(p1, priority=1, stop_threshold=98.0), _slot(p2, priority=2, stop_threshold=95.0)],
++            cache=_no_cache(), temp_host=None, max_providers=3,
++        )
++        result = orch.search(b"fake-bytes")
++
++        self.assertTrue(result.found)
++        self.assertEqual(result.provider, "p2")
++
++    def test_mungfali_stub_is_skipped_cleanly(self):
++        """The unverified/experimental Mungfali adapter must behave like any
++        other unavailable provider: logged and skipped, chain continues."""
++        mungfali = MungfaliProvider(api_key="dummy")
++        p2 = _FakeProvider("p2", match=ProviderMatch(website="Ok", url="https://ok.example/x", similarity=97.0))
++
++        orch = ReverseSearchOrchestrator(
++            slots=[_slot(mungfali, priority=1, stop_threshold=90.0), _slot(p2, priority=2, stop_threshold=95.0)],
++            cache=_no_cache(), temp_host=None, max_providers=3,
++        )
++        result = orch.search(b"fake-bytes")
++
++        self.assertTrue(result.found)
++        self.assertEqual(result.provider, "p2")
++
++    def test_max_providers_caps_the_chain(self):
++        p1 = _FakeProvider("p1", match=ProviderMatch(website="Weak", url="https://weak.example/x", similarity=10.0))
++        p2 = _FakeProvider("p2", match=ProviderMatch(website="Weak2", url="https://weak2.example/x", similarity=5.0))
++        p3 = _FakeProvider("p3", match=ProviderMatch(website="Strong", url="https://strong.example/x", similarity=99.0))
++
++        orch = ReverseSearchOrchestrator(
++            slots=[
++                _slot(p1, priority=1, stop_threshold=98.0),
++                _slot(p2, priority=2, stop_threshold=98.0),
++                _slot(p3, priority=3, stop_threshold=98.0),
++            ],
++            cache=_no_cache(), temp_host=None, max_providers=2,
++        )
++        result = orch.search(b"fake-bytes")
++
++        # p3 (priority 3) is beyond max_providers=2 and must never be tried,
++        # even though it's the only one that would have matched confidently.
++        self.assertEqual(p1.calls, 1)
++        self.assertEqual(p2.calls, 1)
++        self.assertEqual(p3.calls, 0)
++        self.assertEqual(result.provider, "p1")  # best of the two actually tried (10.0 > 5.0)
++
++    def test_cache_hit_skips_every_provider(self):
++        p1 = _FakeProvider("p1", match=ProviderMatch(website="X", url="https://x.example", similarity=99.0))
++
++        fake_cache_client = MagicMock()
++        fake_cache_client.available = True
++        fake_cache_client.get.return_value = {
++            "found": True, "website": "Cached", "url": "https://cached.example",
++            "similarity": 99.9, "provider": "p1",
++        }
++        cache = ReverseSearchCache(fake_cache_client, ttl_found=300, ttl_not_found=60)
++
++        orch = ReverseSearchOrchestrator(
++            slots=[_slot(p1, priority=1, stop_threshold=98.0)],
++            cache=cache, temp_host=None, max_providers=3,
++        )
++        result = orch.search(b"fake-bytes")
++
++        self.assertTrue(result.cache_hit)
++        self.assertEqual(result.website, "Cached")
++        self.assertEqual(p1.calls, 0, "a cache hit must never call any provider")
++
++
++# ===========================================================================
++# TestReverseSearchCacheTTL
++# ===========================================================================
++
++class TestReverseSearchCacheTTL(unittest.TestCase):
++
++    def test_found_result_uses_the_long_ttl(self):
++        fake_cache_client = MagicMock()
++        fake_cache_client.available = True
++        cache = ReverseSearchCache(fake_cache_client, ttl_found=2_592_000, ttl_not_found=86_400)
++
++        result = ReverseSearchResult(found=True, website="W", url="https://w", similarity=99.0, provider="p1", elapsed_ms=10)
++        cache.set("digest123", result)
++
++        args, kwargs = fake_cache_client.set.call_args
++        ttl_used = args[2] if len(args) > 2 else kwargs.get("ttl")
++        self.assertEqual(ttl_used, 2_592_000)
++
++    def test_not_found_result_uses_the_short_ttl(self):
++        fake_cache_client = MagicMock()
++        fake_cache_client.available = True
++        cache = ReverseSearchCache(fake_cache_client, ttl_found=2_592_000, ttl_not_found=86_400)
++
++        result = ReverseSearchResult(found=False, website=None, url=None, similarity=0.0, provider=None, elapsed_ms=10)
++        cache.set("digest123", result)
++
++        args, kwargs = fake_cache_client.set.call_args
++        ttl_used = args[2] if len(args) > 2 else kwargs.get("ttl")
++        self.assertEqual(ttl_used, 86_400)
++
++    def test_set_is_a_noop_when_cache_unavailable(self):
++        cache = ReverseSearchCache(cache_client=None, ttl_found=300, ttl_not_found=60)
++        result = ReverseSearchResult(found=True, website="W", url="https://w", similarity=99.0, provider="p1", elapsed_ms=10)
++        cache.set("digest123", result)  # must not raise
++
++
++# ===========================================================================
++# TestRetryPolicy
++# ===========================================================================
++
++class TestRetryPolicy(unittest.TestCase):
++
++    def setUp(self):
++        # Retry backoff sleeps are real work we don't want slowing the suite down.
++        patcher = patch("app.reverse_search.providers.base.time.sleep")
++        self.addCleanup(patcher.stop)
++        patcher.start()
++
++    def test_retries_on_transient_error_then_succeeds(self):
++        attempts = {"n": 0}
++
++        def flaky():
++            attempts["n"] += 1
++            if attempts["n"] < 3:
++                raise ProviderTransientError("p1", 503)
++            return "ok"
++
++        result = retry_call(flaky, max_retries=3)
++        self.assertEqual(result, "ok")
++        self.assertEqual(attempts["n"], 3)
++
++    def test_gives_up_after_max_retries(self):
++        def always_fails():
++            raise ProviderTransientError("p1", 503)
++
++        with self.assertRaises(ProviderTransientError):
++            retry_call(always_fails, max_retries=2)
++
++    def test_auth_error_is_never_retried(self):
++        calls = {"n": 0}
++
++        def unauthorized():
++            calls["n"] += 1
++            raise ProviderAuthError("p1", 401)
++
++        with self.assertRaises(ProviderAuthError):
++            retry_call(unauthorized, max_retries=5)
++        self.assertEqual(calls["n"], 1, "auth errors must never be retried")
++
++    def test_rate_limit_error_is_retried(self):
++        attempts = {"n": 0}
++
++        def rate_limited_once():
++            attempts["n"] += 1
++            if attempts["n"] < 2:
++                raise ProviderRateLimitError("p1", retry_after=0.01)
++            return "ok"
++
++        result = retry_call(rate_limited_once, max_retries=2)
++        self.assertEqual(result, "ok")
++        self.assertEqual(attempts["n"], 2)
++
++
++# ===========================================================================
++# TestReverseImageSearchIntegration — Flask route -> orchestrator -> real
++# GoogleVisionProvider parsing logic, with only the outbound HTTP call mocked.
++# ===========================================================================
++
++def _build_test_config(max_batch_size: int = 20):
++    """Shared minimal AppConfig for Flask-integration tests in this file."""
++    from app.config import (
++        AppConfig, QdrantConfig, RedisConfig, ModelConfig, ApiRotatorConfig,
++        SecurityConfig, StorageConfig, ObservabilityConfig,
++        ReverseSearchConfig, ProviderSettings,
++    )
++    return AppConfig(
++        qdrant=QdrantConfig(host="x", port=1, collection="x", api_key=None),
++        redis=RedisConfig(host="127.0.0.1", port=1, password=None, db=0, socket_timeout=0.1,
++                           embedding_ttl=60, result_ttl=60, job_ttl=60),
++        model=ModelConfig(siglip_model_id="x", clip_model_id="x", device="cpu",
++                           max_batch_size=1, inference_timeout_s=1.0),
++        api_rotator=ApiRotatorConfig(serpapi_key=None, zenserp_key=None, usage_backend="file",
++                                      usage_file="/tmp/xplagiax_test_usage.json", request_timeout_s=1.0,
++                                      max_retries=1, serpapi_limit=1, zenserp_limit=1,
++                                      health_check_interval=9999),
++        security=SecurityConfig(
++            api_key=None, admin_api_key=None, require_auth=False,
++            max_image_bytes=5 * 1024 * 1024, max_image_pixels=40_000_000,
++            allowed_mime_types=frozenset({"jpeg", "png", "webp"}),
++            rate_limit_per_minute=10_000, rate_limit_per_hour=100_000,
++            trusted_proxies=(), trusted_proxy_count=0, allow_local_image_path=False,
++        ),
++        storage=StorageConfig(image_backend="local", local_base_path="/tmp", seaweedfs_replication="000",
++                               seaweedfs_collection="", seaweedfs_ttl="", seaweedfs_request_timeout=1.0,
++                               seaweedfs_max_retries=1, seaweedfs_filer_url=None, seaweedfs_public_url=None,
++                               seaweedfs_master_url=None, seaweedfs_public_volume_url=None),
++        observability=ObservabilityConfig(log_level="ERROR", log_format="text", prometheus_enabled=False,
++                                           prometheus_port=9, otel_enabled=False, otel_endpoint=None,
++                                           service_name="test", environment="test"),
++        reverse_search=ReverseSearchConfig(
++            enabled=True, max_providers=3, max_retries=1, max_batch_size=max_batch_size,
++            cache_ttl_found=300, cache_ttl_not_found=60,
++            public_base_url=None, temp_hosting_ttl=30,
++            google_vision_api_key="fake-vision-key",
++            google_vision=ProviderSettings(enabled=True, priority=1, stop_threshold=98.0,
++                                            timeout_s=1.0, requires_public_url=False),
++            serper_api_key=None,
++            serper=ProviderSettings(enabled=False, priority=2, stop_threshold=95.0,
++                                     timeout_s=1.0, requires_public_url=True),
++            mungfali_api_key=None,
++            mungfali=ProviderSettings(enabled=False, priority=3, stop_threshold=90.0,
++                                       timeout_s=1.0, requires_public_url=True),
++        ),
++        debug=False, workers=1,
++    )
++
++
++def _fake_vision_response(similarity_full_match: bool = True):
++    fake_response = MagicMock()
++    fake_response.status_code = 200
++    fake_response.json.return_value = {
++        "responses": [{
++            "webDetection": {
++                "fullMatchingImages": [{"url": "https://example.com/exact.jpg"}] if similarity_full_match else [],
++                "pagesWithMatchingImages": [{
++                    "url": "https://es.wikipedia.org/wiki/Example",
++                    "pageTitle": "Example - Wikipedia",
++                }],
++            }
++        }]
++    }
++    return fake_response
++
++
++class TestReverseImageSearchIntegration(unittest.TestCase):
++
++    def test_end_to_end_match_via_mocked_vision_api(self):
++        import io
++        from PIL import Image
++        from app.reverse_search.app import create_app
++
++        buf = io.BytesIO()
++        Image.new("RGB", (64, 64), color=(10, 20, 30)).save(buf, format="JPEG")
++        jpeg_bytes = buf.getvalue()
++
++        with patch("requests.Session.post", return_value=_fake_vision_response()):
++            app = create_app(config=_build_test_config())
++            client = app.test_client()
++            resp = client.post(
++                "/api/v1/reverse-image-search",
++                data={"image": (io.BytesIO(jpeg_bytes), "photo.jpg")},
++                content_type="multipart/form-data",
++            )
++
++        self.assertEqual(resp.status_code, 200)
++        body = resp.get_json()
++        self.assertEqual(set(body.keys()), {"found", "website", "url", "similarity", "provider", "elapsed_ms"})
++        self.assertTrue(body["found"])
++        self.assertEqual(body["provider"], "google_vision")
++        self.assertEqual(body["website"], "Example - Wikipedia")
++        self.assertEqual(body["url"], "https://es.wikipedia.org/wiki/Example")
++        self.assertEqual(body["similarity"], 99.0)
++
++    def test_missing_image_returns_400(self):
++        from app.reverse_search.app import create_app
++        app = create_app(config=_build_test_config())
++        client = app.test_client()
++        resp = client.post("/api/v1/reverse-image-search", data={})
++        self.assertEqual(resp.status_code, 400)
++        self.assertEqual(resp.get_json()["code"], "MISSING_FILE")
++
++
++# ===========================================================================
++# TestReverseImageSearchBatch — POST /api/v1/reverse-image-search/batch
++# ===========================================================================
++
++class TestReverseImageSearchBatch(unittest.TestCase):
++
++    @staticmethod
++    def _jpeg_bytes(color=(10, 20, 30)):
++        import io
++        from PIL import Image
++        buf = io.BytesIO()
++        Image.new("RGB", (64, 64), color=color).save(buf, format="JPEG")
++        return buf.getvalue()
++
++    def test_batch_processes_each_image_independently(self):
++        import io
++        from app.reverse_search.app import create_app
++
++        with patch("requests.Session.post", return_value=_fake_vision_response()):
++            app = create_app(config=_build_test_config())
++            client = app.test_client()
++            resp = client.post(
++                "/api/v1/reverse-image-search/batch",
++                data={
++                    "files": [
++                        (io.BytesIO(self._jpeg_bytes()), "a.jpg"),
++                        (io.BytesIO(self._jpeg_bytes()), "b.jpg"),
++                    ],
++                },
++                content_type="multipart/form-data",
++            )
++
++        self.assertEqual(resp.status_code, 207)
++        body = resp.get_json()
++        self.assertEqual(body["count"], 2)
++        sources = {r["source"] for r in body["results"]}
++        self.assertEqual(sources, {"a.jpg", "b.jpg"})
++        for r in body["results"]:
++            self.assertTrue(r["found"])
++            self.assertEqual(r["provider"], "google_vision")
++
++    def test_batch_reports_per_item_validation_errors(self):
++        import io
++        from app.reverse_search.app import create_app
++
++        with patch("requests.Session.post", return_value=_fake_vision_response()):
++            app = create_app(config=_build_test_config())
++            client = app.test_client()
++            resp = client.post(
++                "/api/v1/reverse-image-search/batch",
++                data={
++                    "files": [
++                        (io.BytesIO(self._jpeg_bytes()), "good.jpg"),
++                        (io.BytesIO(b"not an image"), "bad.jpg"),
++                    ],
++                },
++                content_type="multipart/form-data",
++            )
++
++        self.assertEqual(resp.status_code, 207)
++        by_source = {r["source"]: r for r in resp.get_json()["results"]}
++        self.assertTrue(by_source["good.jpg"]["found"])
++        self.assertEqual(by_source["bad.jpg"]["code"], "INVALID_IMAGE")
++
++    def test_batch_over_the_cap_is_rejected(self):
++        import io
++        from app.reverse_search.app import create_app
++
++        app = create_app(config=_build_test_config(max_batch_size=2))
++        client = app.test_client()
++        resp = client.post(
++            "/api/v1/reverse-image-search/batch",
++            data={
++                "files": [
++                    (io.BytesIO(self._jpeg_bytes()), "a.jpg"),
++                    (io.BytesIO(self._jpeg_bytes()), "b.jpg"),
++                    (io.BytesIO(self._jpeg_bytes()), "c.jpg"),
++                ],
++            },
++            content_type="multipart/form-data",
++        )
++
++        self.assertEqual(resp.status_code, 400)
++        self.assertEqual(resp.get_json()["code"], "BATCH_TOO_LARGE")
++
++    def test_empty_batch_returns_400(self):
++        from app.reverse_search.app import create_app
++        app = create_app(config=_build_test_config())
++        client = app.test_client()
++        resp = client.post("/api/v1/reverse-image-search/batch", data={})
++        self.assertEqual(resp.status_code, 400)
++        self.assertEqual(resp.get_json()["code"], "MISSING_FILES")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_suite.py b/tests/test_suite.py
+index 7b21f77..7eb8ae2 100644
+--- a/tests/test_suite.py
++++ b/tests/test_suite.py
+@@ -331,7 +331,8 @@ class TestApiRoutes(unittest.TestCase):
+         from app.factory import create_app
+         from app.config import (
+             AppConfig, QdrantConfig, RedisConfig, ModelConfig,
+-            ApiRotatorConfig, SecurityConfig, StorageConfig, ObservabilityConfig
++            ApiRotatorConfig, SecurityConfig, StorageConfig, ObservabilityConfig,
++            ReverseSearchConfig, ProviderSettings,
+         )
+ 
+         import dataclasses
+@@ -382,6 +383,27 @@ class TestApiRoutes(unittest.TestCase):
+                 otel_enabled=False, otel_endpoint=None,
+                 service_name="test-service", environment="test",
+             ),
++            reverse_search=ReverseSearchConfig(
++                enabled=False,
++                max_providers=3, max_retries=1, max_batch_size=20,
++                cache_ttl_found=300, cache_ttl_not_found=60,
++                public_base_url=None, temp_hosting_ttl=30,
++                google_vision_api_key=None,
++                google_vision=ProviderSettings(
++                    enabled=False, priority=1, stop_threshold=98.0,
++                    timeout_s=1.0, requires_public_url=False,
++                ),
++                serper_api_key=None,
++                serper=ProviderSettings(
++                    enabled=False, priority=2, stop_threshold=95.0,
++                    timeout_s=1.0, requires_public_url=True,
++                ),
++                mungfali_api_key=None,
++                mungfali=ProviderSettings(
++                    enabled=False, priority=3, stop_threshold=90.0,
++                    timeout_s=1.0, requires_public_url=True,
++                ),
++            ),
+             debug=False,
+             workers=1,
+         )

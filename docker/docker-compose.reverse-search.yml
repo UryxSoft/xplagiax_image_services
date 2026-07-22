@@ -1,0 +1,78 @@
+version: "3.9"
+
+# ==============================================================
+# Standalone deployment: reverse-image-search microservice + Redis ONLY.
+# No Qdrant, no SeaweedFS, no ML worker — nothing else needs to start. The
+# tight memory limits below are a live demonstration of the "extremely
+# lightweight" requirement, not just a claim in a doc.
+#
+# Usage:
+#   export SERVICE_API_KEY=...  REVERSE_SEARCH_PUBLIC_BASE_URL=https://...
+#   docker compose -f docker/docker-compose.reverse-search.yml up -d
+# ==============================================================
+
+services:
+
+  reverse-search:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.reverse-search
+    image: xplagiax-reverse-search:latest
+    container_name: xplagiax-reverse-search
+    restart: unless-stopped
+    networks:
+      - reverse-search-net
+    ports:
+      - "5020:5020"
+    # No env_file: secrets are injected from the shell / secret store, never
+    # committed. ${VAR:?msg} fails fast if a required secret is missing.
+    environment:
+      REQUIRE_AUTH: "true"
+      SERVICE_API_KEY: ${SERVICE_API_KEY:?set SERVICE_API_KEY}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      GOOGLE_VISION_API_KEY: ${GOOGLE_VISION_API_KEY:-}
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
+      MUNGFALI_API_KEY: ${MUNGFALI_API_KEY:-}
+      MUNGFALI_ENABLED: "false"
+      # Required only if a URL-based provider (Serper Lens) is enabled — must
+      # be a real, internet-reachable URL for this service.
+      REVERSE_SEARCH_PUBLIC_BASE_URL: ${REVERSE_SEARCH_PUBLIC_BASE_URL:-}
+      SERVICE_NAME: xplagiax-reverse-search
+      ENVIRONMENT: production
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5020/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1"
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: xplagiax-reverse-search-redis
+    restart: unless-stopped
+    networks:
+      - reverse-search-net
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+          cpus: "0.5"
+
+networks:
+  reverse-search-net:
+    driver: bridge

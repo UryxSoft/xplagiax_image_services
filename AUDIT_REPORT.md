@@ -136,3 +136,79 @@ dependencias (SCA) en CI.*
 # Suite de pruebas (71 tests): lógica pura + integración Flask (deps ML mockeadas)
 python -m unittest tests.test_suite -v
 ```
+
+---
+
+## 8. Módulo `reverse_search` — orquestador ligero de reverse image search (nuevo)
+
+Requisito de negocio: un endpoint cuya única responsabilidad sea reverse
+image search vía APIs externas, sin ningún modelo local (sin CLIP/YOLO/
+ResNet/embeddings/GPU), con **Early Stop** configurable para minimizar
+llamadas pagadas, y una respuesta reducida a 6 campos
+(`found, website, url, similarity, provider, elapsed_ms`).
+
+### 8.1 Decisión de alcance
+
+El repo ya contiene un sistema de producción con CLIP/SigLIP/Qdrant/
+SeaweedFS/RQ — exactamente lo opuesto de "ligero, sin IA local". Dado que
+el requisito no pedía eliminar detección-IA/plagio/similitud (features
+existentes, auditadas, con 74 tests), se optó por **no tocarlas**. En su
+lugar: `app/reverse_search/` es un paquete nuevo, autocontenido, sin
+dependencia de import de `app.models`, `app.storage.vector_repository` ni
+`app.workers` — deployable de dos formas:
+
+1. Integrado en el monolito (`app.factory:create_app`, ya cableado).
+2. **Standalone**, como proceso propio sin torch/transformers/qdrant-client
+   (`app.reverse_search.app:create_app`, `requirements-reverse-search.txt`,
+   `docker/Dockerfile.reverse-search`, `docker/docker-compose.reverse-search.yml`).
+
+### 8.2 Correcciones sobre los proveedores propuestos
+
+| # | Hallazgo | Corrección |
+|---|----------|------------|
+| RS1 | "Serper" (serper.dev) se confundió con "SerpApi" (serpapi.com, ya usado por `SERPAPI_KEY`) — son empresas distintas | Adaptador `serper_lens.py` apunta a `google.serper.dev/lens`, no a `/search` (búsqueda de texto, no reverse image) |
+| RS2 | Google Custom Search (Programmable Search Engine) es búsqueda de imágenes por palabra clave, **no** reverse image search — no existe parámetro de "subir imagen" en esa API | No se implementó como proveedor de reverse search; se usa **Google Vision API (`WEB_DETECTION`)**, que sí es la herramienta correcta de Google para esto |
+| RS3 | Mungfali: su documentación pública describe un producto de búsqueda de imágenes por keyword, sin contrato verificado de "sube esta imagen, dime dónde salió" | `providers/mungfali.py` es una plantilla que implementa el contrato `ReverseSearchProvider` pero siempre lanza `ProviderUnavailableError` (el orquestador la trata como "proveedor caído" y sigue) — `MUNGFALI_ENABLED=false` por defecto |
+| RS4 | API keys de Serper/Mungfali pegadas en texto plano en la conversación | Nunca escritas en el repo (solo placeholders vacíos en `.env.example`); se recomendó rotarlas |
+
+### 8.3 Diseño Early Stop + Cache
+
+- Proveedores ordenados por `*_PRIORITY`; se detiene en el primero cuyo
+  resultado supere su propio `*_STOP_THRESHOLD` (todo configurable por env).
+- Google Vision (bytes inline, sin URL pública) es prioridad 1 por defecto:
+  el caso común nunca paga el costo de exponer la imagen públicamente.
+- SHA-256 calculado **una sola vez** por request (`orchestrator.search()`),
+  reusado como clave de cache — nunca se re-lee ni re-hashea la imagen.
+- Cache con TTL asimétrico: resultados positivos (30d por defecto) duran
+  mucho más que los negativos (1d) — una copia encontrada rara vez
+  desaparece, pero "no encontrado hoy" puede cambiar cuando el índice del
+  proveedor crece.
+- Retry solo en 429/500/502/503/504 (respeta `Retry-After`), nunca en
+  401/403/404 — política única en `providers/base.py::retry_call`.
+
+### 8.4 Concurrencia
+
+`requests.Session` (pooled, keep-alive) en vez de asyncio/aiohttp/ThreadPool/
+ProcessPool: la cadena Early Stop es intrínsecamente secuencial (llamar,
+evaluar, decidir si continuar), así que no hay nada que paralelizar dentro
+de un request sin romper el objetivo de ahorro de cuota. La concurrencia
+entre requests de clientes la da Gunicorn+gevent (ya usado en este repo),
+que hace cooperativas las llamadas HTTP sin escribir async/await.
+
+### 8.5 Batch (`POST /api/v1/reverse-image-search/batch`)
+
+Añadido a pedido: múltiples imágenes en un solo request (`files` multipart y/o
+`image_urls`), tope configurable (`REVERSE_SEARCH_MAX_BATCH_SIZE`, 20 por
+defecto). Cada imagen es independiente (su propio SHA-256, cache y cadena
+Early Stop), así que se procesan **concurrentemente** con `gevent.spawn` +
+`joinall` — a diferencia de la cadena de proveedores dentro de una misma
+imagen, que sigue siendo secuencial porque de eso depende el ahorro de Early
+Stop. El `requests.Session` compartido ya era usado concurrentemente entre
+requests de distintos clientes bajo el worker gevent; esto extiende la misma
+propiedad dentro de un solo request.
+
+### 8.6 Verificación
+
+```bash
+python -m unittest tests.test_reverse_search -v   # 21 tests
+```

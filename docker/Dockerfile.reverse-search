@@ -1,0 +1,91 @@
+# ==============================================================
+# docker/Dockerfile.reverse-search
+#
+# Standalone image for the lightweight reverse-image-search microservice.
+# No torch, no transformers, no CUDA, no HuggingFace cache, no Qdrant client,
+# no SeaweedFS — only the modules app.reverse_search.app actually imports.
+# ==============================================================
+
+# --------------------------------------------------------------
+# Stage 1 — Builder
+# --------------------------------------------------------------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libjpeg-dev \
+    libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-reverse-search.txt .
+RUN pip install --upgrade pip --no-cache-dir && \
+    pip install --prefix=/install --no-cache-dir -r requirements-reverse-search.txt
+
+# --------------------------------------------------------------
+# Stage 2 — Runtime
+# --------------------------------------------------------------
+FROM python:3.11-slim AS runtime
+
+LABEL description="xplagiax reverse-image-search — lightweight, no local ML" \
+      version="1.0.0"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg62-turbo \
+    libpng16-16 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r reversesearch && \
+    useradd -r -g reversesearch -d /app -s /sbin/nologin reversesearch
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+
+# Only the packages this service actually imports — deliberately excludes
+# app/models, app/storage, app/services/{similarity,indexing}.py and
+# app/workers, so the "no local ML" guarantee is visible in the build itself,
+# not just in requirements-reverse-search.txt.
+COPY app/__init__.py                   ./app/__init__.py
+COPY app/config.py                     ./app/config.py
+COPY app/reverse_search/               ./app/reverse_search/
+COPY app/security/                     ./app/security/
+COPY app/observability/                ./app/observability/
+COPY app/cache/                        ./app/cache/
+COPY app/utils/                        ./app/utils/
+COPY docker/gunicorn.reverse_search.conf.py ./gunicorn.conf.py
+
+RUN mkdir -p /tmp/reverse_search && \
+    chown -R reversesearch:reversesearch /app /tmp/reverse_search
+
+USER reversesearch
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    FLASK_DEBUG=false \
+    PORT=5020 \
+    LOG_LEVEL=INFO \
+    LOG_FORMAT=json \
+    REVERSE_SEARCH_ENABLED=true \
+    REQUIRE_AUTH=true \
+    MAX_IMAGE_BYTES=10485760 \
+    ALLOWED_MIME_TYPES=jpeg,png,webp \
+    RATE_LIMIT_PER_MINUTE=30 \
+    RATE_LIMIT_PER_HOUR=500 \
+    PROMETHEUS_ENABLED=false \
+    SERVICE_NAME=xplagiax-reverse-search \
+    ENVIRONMENT=production
+
+EXPOSE 5020
+
+HEALTHCHECK \
+    --interval=30s \
+    --timeout=5s \
+    --start-period=15s \
+    --retries=3 \
+    CMD curl -f http://localhost:${PORT}/healthz || exit 1
+
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "app.reverse_search.app:create_app()"]
